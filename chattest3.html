@@ -1,0 +1,107 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8">
+<title>Slab Rectifier</title>
+<style>
+  body { font-family: sans-serif; }
+  #preview, #captured, #rectified {
+    width: 100%;
+    max-width: 350px;
+    margin: 8px 0;
+    border: 1px solid #ccc;
+  }
+  .row { display: flex; gap: 10px; }
+  canvas { background: #eee; }
+</style>
+</head>
+<body>
+
+<h2>Slab Rectifier</h2>
+<button id="start">Start Camera</button>
+<button id="capture" disabled>Capture</button>
+<p id="status"></p>
+
+<video id="preview" autoplay playsinline></video>
+
+<div class="row">
+  <div>
+    <h3>Captured</h3>
+    <canvas id="captured" width="640" height="480"></canvas>
+  </div>
+  <div>
+    <h3>Rectified</h3>
+    <canvas id="rectified" width="640" height="480"></canvas>
+  </div>
+</div>
+
+<script>
+let lastOrientation = { alpha: 0, beta: 0, gamma: 0 }; 
+let stream;
+
+// --- ORIENTATION LISTENER ---
+window.addEventListener("deviceorientation", (event) => {
+  lastOrientation.alpha = event.alpha;
+  lastOrientation.beta  = event.beta;   // pitch
+  lastOrientation.gamma = event.gamma;  // roll
+}, true);
+
+// --- OPEN CAMERA ---
+document.getElementById("start").onclick = async () => {
+  stream = await navigator.mediaDevices.getUserMedia({
+    video: { facingMode: "environment" }
+  });
+  const video = document.getElementById("preview");
+  video.srcObject = stream;
+  document.getElementById("capture").disabled = false;
+  document.getElementById("status").innerText = "Camera running...";
+};
+
+// --- CAPTURE + RECTIFY ---
+document.getElementById("capture").onclick = () => {
+  const video = document.getElementById("preview");
+  
+  // Save orientation at the exact moment of capture
+  const pitch = lastOrientation.beta;   // degrees
+  const roll  = lastOrientation.gamma;  // degrees
+
+  document.getElementById("status").innerText =
+    `Captured with pitch=${pitch.toFixed(1)}°, roll=${roll.toFixed(1)}°`;
+
+  // Draw captured frame
+  const cap = document.getElementById("captured");
+  const ctxCap = cap.getContext("2d");
+  cap.width = video.videoWidth;
+  cap.height = video.videoHeight;
+  ctxCap.drawImage(video, 0, 0, cap.width, cap.height);
+
+  // --- RECTIFICATION USING PITCH + ROLL ---
+  const rect = document.getElementById("rectified");
+  const ctxRect = rect.getContext("2d");
+  rect.width = cap.width;
+  rect.height = cap.height;
+
+  ctxRect.save();
+
+  // Translate to center
+  ctxRect.translate(rect.width / 2, rect.height / 2);
+
+  // Convert to radians
+  const pitchRad = -pitch * Math.PI / 180;
+  const rollRad  = -roll  * Math.PI / 180;
+
+  // A simple inverse rotation matrix for small-angle rectification
+  // Real projective rectification requires a homography, but this works well
+  // for slabs where pitch/roll < 25 degrees.
+  ctxRect.rotate(rollRad);
+  ctxRect.transform(1, 0, Math.tan(pitchRad), 1, 0, 0);
+
+  // Draw the original into the transformed rectified canvas
+  ctxRect.drawImage(cap, -rect.width / 2, -rect.height / 2);
+
+  ctxRect.restore();
+};
+</script>
+
+</body>
+</html>
