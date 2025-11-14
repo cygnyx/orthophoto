@@ -1,0 +1,174 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8" />
+<title>Debug Orientation + Capture</title>
+<style>
+  body{font-family:system-ui,Arial; padding:16px; max-width:680px}
+  button{padding:8px 12px; margin:6px}
+  #readouts{margin-top:8px; font-size:0.95rem}
+  canvas{border:1px solid #ccc; margin-top:8px; max-width:100%}
+  pre{background:#f7f7f7;padding:8px;border-radius:6px}
+</style>
+</head>
+<body>
+  <h2>Orientation Debug + Photo Capture</h2>
+
+  <div>
+    <button id="startSensors">Start Sensors (required)</button>
+    <button id="openCam">Open Camera Stream</button>
+    <input id="fileInput" type="file" accept="image/*" capture="environment" style="display:inline-block">
+    <button id="captureBtn">Capture (use last orientation)</button>
+  </div>
+
+  <div id="readouts">
+    <div>Sensor supported:
+      <span id="supported">—</span>
+    </div>
+    <div>Permission state:
+      <span id="perm">—</span>
+    </div>
+    <div>Live orientation (alpha, beta, gamma): 
+      <span id="alpha">—</span>,
+      <span id="beta">—</span>,
+      <span id="gamma">—</span>
+    </div>
+    <div>Captured orientation at photo:
+      <span id="captured">—</span>
+    </div>
+    <div id="notes" style="color:#666;margin-top:6px"></div>
+  </div>
+
+  <canvas id="preview" width="720" height="960"></canvas>
+
+<script>
+let lastOrientation = {alpha:null, beta:null, gamma:null, time:null};
+const supportedSpan = document.getElementById('supported');
+const permSpan = document.getElementById('perm');
+const aSpan = document.getElementById('alpha');
+const bSpan = document.getElementById('beta');
+const gSpan = document.getElementById('gamma');
+const capturedSpan = document.getElementById('captured');
+const notes = document.getElementById('notes');
+const preview = document.getElementById('preview');
+const ctx = preview.getContext('2d');
+
+supportedSpan.textContent = (typeof DeviceOrientationEvent !== 'undefined') ? 'yes' : 'no';
+
+async function startSensors() {
+  // iOS requires permission request in a user gesture
+  if (typeof DeviceOrientationEvent !== 'undefined' &&
+      typeof DeviceOrientationEvent.requestPermission === 'function') {
+    try {
+      const p = await DeviceOrientationEvent.requestPermission();
+      permSpan.textContent = p;
+      if (p === 'granted') {
+        window.addEventListener('deviceorientation', handleOrientation);
+        notes.textContent = 'DeviceOrientation granted — move the phone to see live numbers.';
+      } else {
+        notes.textContent = 'Permission denied. Check Settings -> Safari -> Motion & Orientation Access';
+      }
+    } catch (err) {
+      permSpan.textContent = 'error';
+      notes.textContent = 'requestPermission threw: ' + err;
+    }
+  } else {
+    // Non-iOS: just attach listener
+    permSpan.textContent = 'n/a';
+    window.addEventListener('deviceorientation', handleOrientation);
+    notes.textContent = 'Listening for deviceorientation (non-iOS).';
+  }
+}
+
+function handleOrientation(e) {
+  // alpha: compass yaw, beta: front/back (pitch), gamma: left/right (roll)
+  const alpha = (e.alpha === null) ? null : Number(e.alpha);
+  const beta  = (e.beta  === null) ? null : Number(e.beta);
+  const gamma = (e.gamma === null) ? null : Number(e.gamma);
+
+  lastOrientation = { alpha, beta, gamma, time: Date.now() };
+  aSpan.textContent = alpha === null ? 'null' : alpha.toFixed(1);
+  bSpan.textContent = beta  === null ? 'null' : beta.toFixed(1);
+  gSpan.textContent = gamma === null ? 'null' : gamma.toFixed(1);
+}
+
+// Optionally open camera stream to help some devices
+let stream = null;
+document.getElementById('openCam').addEventListener('click', async () => {
+  try {
+    if (!stream) {
+      stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: "environment" }, audio: false });
+      const v = document.createElement('video');
+      v.autoplay = true;
+      v.playsInline = true;
+      v.srcObject = stream;
+      v.style.display = 'none';
+      document.body.appendChild(v);
+      // draw small preview
+      v.addEventListener('loadedmetadata', () => {
+        preview.width = v.videoWidth;
+        preview.height = v.videoHeight;
+        const raf = () => {
+          ctx.drawImage(v, 0, 0, preview.width, preview.height);
+          requestAnimationFrame(raf);
+        };
+        raf();
+      });
+      notes.textContent = 'Camera stream opened (some devices only enable sensors while camera is active).';
+    } else {
+      // stop
+      stream.getTracks().forEach(t => t.stop());
+      stream = null;
+      notes.textContent = 'Camera stream stopped.';
+    }
+  } catch(err) {
+    notes.textContent = 'getUserMedia error: ' + err;
+  }
+});
+
+// Hook up Start Sensors button
+document.getElementById('startSensors').addEventListener('click', startSensors);
+
+// capture logic: read file input or canvas current frame and record lastOrientation
+document.getElementById('captureBtn').addEventListener('click', () => {
+  const fileInput = document.getElementById('fileInput');
+  // pick the lastOrientation at moment of capture
+  const captured = {...lastOrientation};
+  capturedSpan.textContent = JSON.stringify(captured);
+  // If there's an image file selected, draw it to canvas and note captured orientation
+  const f = fileInput.files && fileInput.files[0];
+  if (f) {
+    const img = new Image();
+    img.onload = () => {
+      // scale to canvas
+      preview.width = img.naturalWidth;
+      preview.height = img.naturalHeight;
+      ctx.drawImage(img, 0, 0, preview.width, preview.height);
+      notes.textContent = 'Drew selected photo to canvas; orientation captured.';
+    };
+    img.onerror = (err) => { notes.textContent = 'Image load error: ' + err; };
+    img.src = URL.createObjectURL(f);
+  } else if (stream) {
+    // stream already populates canvas via requestAnimationFrame
+    notes.textContent = 'Captured current camera frame; orientation captured.';
+  } else {
+    notes.textContent = 'No file selected and camera not open; still recorded orientation.';
+  }
+});
+
+// file input changes: draw thumbnail so user can see image
+document.getElementById('fileInput').addEventListener('change', (e) => {
+  const f = e.target.files && e.target.files[0];
+  if (!f) return;
+  const img = new Image();
+  img.onload = () => {
+    preview.width = img.naturalWidth;
+    preview.height = img.naturalHeight;
+    ctx.drawImage(img, 0, 0, preview.width, preview.height);
+  };
+  img.src = URL.createObjectURL(f);
+});
+
+</script>
+</body>
+</html>
