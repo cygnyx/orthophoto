@@ -1,0 +1,277 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8"/>
+<title>Full Homography Rectifier (OpenCV.js)</title>
+<style>
+  body{font-family:system-ui,Arial; padding:16px; max-width:1000px}
+  h2{margin:0 0 8px}
+  .controls{display:flex; gap:8px; align-items:center; margin-bottom:8px}
+  video, canvas{border:1px solid #ccc; max-width:100%}
+  .row{display:flex; gap:12px; flex-wrap:wrap}
+  .col{flex:1 1 320px}
+  label{font-size:0.9rem}
+  #status{color:#333;margin-top:6px}
+</style>
+</head>
+<body>
+  <h2>Full Homography Rectifier (OpenCV.js)</h2>
+
+  <div class="controls">
+    <button id="startBtn">Start Camera</button>
+    <button id="captureBtn" disabled>Capture</button>
+    <label>Estimated camera FOV (deg):
+      <input id="fov" type="number" value="60" min="20" max="120" step="1" style="width:70px">
+    </label>
+    <label>Output scale:
+      <input id="scale" type="number" value="1.0" min="0.2" max="2" step="0.1" style="width:70px">
+    </label>
+  </div>
+
+  <div id="status">Loading OpenCV...</div>
+
+  <video id="video" autoplay playsinline style="display:block; width:320px; height:auto"></video>
+
+  <div class="row" style="margin-top:12px">
+    <div class="col">
+      <h3>Captured</h3>
+      <canvas id="capturedCanvas"></canvas>
+    </div>
+    <div class="col">
+      <h3>Rectified</h3>
+      <canvas id="rectifiedCanvas"></canvas>
+    </div>
+  </div>
+
+  <script async src="https://docs.opencv.org/4.x/opencv.js" onload="onOpenCvReady();" ></script>
+  <script>
+  let ModuleReady = false;
+  function onOpenCvReady() {
+    ModuleReady = true;
+    document.getElementById('status').innerText = "OpenCV ready. Start camera.";
+  }
+
+  // Orientation state
+  let lastOrientation = {alpha:0, beta:0, gamma:0, time:0};
+  // Request permission on iOS (must be done in user gesture)
+  async function requestOrientationPermissionIfNeeded() {
+    if (typeof DeviceOrientationEvent !== 'undefined' &&
+        typeof DeviceOrientationEvent.requestPermission === 'function') {
+      try {
+        const p = await DeviceOrientationEvent.requestPermission();
+        if (p === 'granted') {
+          window.addEventListener('deviceorientation', handleOrientation, true);
+          return true;
+        } else {
+          alert('Device orientation permission not granted. Rotation will be zero.');
+          return false;
+        }
+      } catch(err) {
+        console.warn('Orientation permission error', err);
+        return false;
+      }
+    } else {
+      window.addEventListener('deviceorientation', handleOrientation, true);
+      return true;
+    }
+  }
+
+  function handleOrientation(e) {
+    lastOrientation = {
+      alpha: (e.alpha === null ? 0 : e.alpha),
+      beta:  (e.beta  === null ? 0 : e.beta),
+      gamma: (e.gamma === null ? 0 : e.gamma),
+      time: Date.now()
+    };
+  }
+
+  // Camera setup
+  const startBtn = document.getElementById('startBtn');
+  const captureBtn = document.getElementById('captureBtn');
+  const video = document.getElementById('video');
+  let stream = null;
+
+  startBtn.onclick = async () => {
+    // Ask orientation permission first (iOS needs it on user gesture)
+    await requestOrientationPermissionIfNeeded();
+
+    try {
+      stream = await navigator.mediaDevices.getUserMedia({
+        video: { facingMode: { exact: "environment" } }, // try environment
+        audio: false
+      });
+    } catch (err) {
+      // fallback if exact facingMode not supported
+      stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: "environment" }, audio: false });
+    }
+    video.srcObject = stream;
+    captureBtn.disabled = false;
+    document.getElementById('status').innerText = "Camera running. Move phone to change pitch/roll, then press Capture.";
+  };
+
+  // Utility: build rotation matrices and homography
+  function degToRad(d){ return d * Math.PI / 180; }
+
+  function matMul(A, B) {
+    // multiply 3x3 matrices
+    const C = [];
+    for (let i=0;i<3;i++){ C[i]=[]; for (let j=0;j<3;j++){ C[i][j]=0; } }
+    for (let i=0;i<3;i++){
+      for (let j=0;j<3;j++){
+        for (let k=0;k<3;k++) C[i][j] += A[i][k]*B[k][j];
+      }
+    }
+    return C;
+  }
+
+  function transposeMat(A){
+    const T = [[0,0,0],[0,0,0],[0,0,0]];
+    for(let i=0;i<3;i++) for(let j=0;j<3;j++) T[i][j]=A[j][i];
+    return T;
+  }
+
+  function buildRotationMatrix(alphaDeg, betaDeg, gammaDeg){
+    // alpha (Z), beta (X), gamma (Y)
+    const a = degToRad(alphaDeg || 0);
+    const b = degToRad(betaDeg || 0);
+    const g = degToRad(gammaDeg || 0);
+
+    const Rz = [
+      [ Math.cos(a), -Math.sin(a), 0],
+      [ Math.sin(a),  Math.cos(a), 0],
+      [ 0, 0, 1]
+    ];
+    const Rx = [
+      [1, 0, 0],
+      [0, Math.cos(b), -Math.sin(b)],
+      [0, Math.sin(b),  Math.cos(b)]
+    ];
+    const Ry = [
+      [ Math.cos(g), 0, Math.sin(g)],
+      [ 0, 1, 0],
+      [ -Math.sin(g), 0, Math.cos(g)]
+    ];
+
+    // R = Rz * Rx * Ry
+    return matMul(Rz, matMul(Rx, Ry));
+  }
+
+  function buildK(width, height, fPx) {
+    // Principal point at center
+    const cx = width / 2;
+    const cy = height / 2;
+    return [
+      [fPx, 0, cx],
+      [0, fPx, cy],
+      [0, 0, 1]
+    ];
+  }
+
+  function mat3ToCvMat(mat) {
+    // convert JS 3x3 array to cv.Mat (CV_64F)
+    const m = cv.matFromArray(3, 3, cv.CV_64F, [
+      mat[0][0], mat[0][1], mat[0][2],
+      mat[1][0], mat[1][1], mat[1][2],
+      mat[2][0], mat[2][1], mat[2][2]
+    ]);
+    return m;
+  }
+
+  // Capture callback
+  captureBtn.onclick = async () => {
+    if (!ModuleReady) { alert('OpenCV not ready yet'); return; }
+    // capture current frame to canvas
+    const capCanvas = document.getElementById('capturedCanvas');
+    capCanvas.width = video.videoWidth;
+    capCanvas.height = video.videoHeight;
+    const capCtx = capCanvas.getContext('2d');
+    capCtx.drawImage(video, 0, 0, capCanvas.width, capCanvas.height);
+
+    // get orientation at exact moment
+    const { alpha, beta, gamma } = lastOrientation;
+    document.getElementById('status').innerText = `Captured (alpha=${alpha?.toFixed(1)}°, beta=${beta?.toFixed(1)}°, gamma=${gamma?.toFixed(1)}°)`;
+
+    // Build rotation matrix from device orientation
+    const R = buildRotationMatrix(alpha, beta, gamma);
+
+    // R_inv = R^T (rotation matrix inverse)
+    const R_inv = transposeMat(R);
+
+    // Build K from user-specified FOV
+    const fovDeg = Number(document.getElementById('fov').value) || 60;
+    const width = capCanvas.width;
+    const height = capCanvas.height;
+    // focal length estimate: f = (w/2) / tan(fov/2)
+    const fPx = (width/2) / Math.tan(degToRad(fovDeg/2));
+
+    const K = buildK(width, height, fPx);
+
+    // Compute H = K * R_inv * K^{-1}
+    // First compute K_inv (invert 3x3)
+    function invert3x3(M){
+      const a=M;
+      const m00=a[0][0], m01=a[0][1], m02=a[0][2];
+      const m10=a[1][0], m11=a[1][1], m12=a[1][2];
+      const m20=a[2][0], m21=a[2][1], m22=a[2][2];
+      const det =
+        m00*(m11*m22 - m12*m21) - m01*(m10*m22 - m12*m20) + m02*(m10*m21 - m11*m20);
+      if (Math.abs(det) < 1e-12) return null;
+      const invDet = 1/det;
+      const inv = [
+        [(m11*m22 - m12*m21)*invDet, (m02*m21 - m01*m22)*invDet, (m01*m12 - m02*m11)*invDet],
+        [(m12*m20 - m10*m22)*invDet, (m00*m22 - m02*m20)*invDet, (m02*m10 - m00*m12)*invDet],
+        [(m10*m21 - m11*m20)*invDet, (m01*m20 - m00*m21)*invDet, (m00*m11 - m01*m10)*invDet]
+      ];
+      return inv;
+    }
+
+    const K_inv = invert3x3(K);
+    if (!K_inv) { alert('K inversion failed'); return; }
+
+    let H = matMul(K, matMul(R_inv, K_inv));
+
+    // Convert H to cv.Mat (float64) and normalize so H[2,2] = 1
+    // Then warpPerspective
+    try {
+      const Hmat = mat3ToCvMat(H);
+      // normalize
+      let h22 = Hmat.doubleAt(2,2);
+      if (Math.abs(h22) < 1e-12) h22 = 1.0;
+      cv.multiply(Hmat, cv.Mat.ones(Hmat.rows, Hmat.cols, Hmat.type()), Hmat);
+      // divide everything by h22
+      for (let r=0;r<3;r++){
+        for (let c=0;c<3;c++){
+          let val = Hmat.doubleAt(r,c) / h22;
+          Hmat.doublePtr(r,c)[0] = val;
+        }
+      }
+
+      // prepare src and dst mats
+      const src = cv.imread(capCanvas); // RGBA
+      // scale output if requested
+      const scale = Number(document.getElementById('scale').value) || 1.0;
+      const dstW = Math.round(src.cols * scale);
+      const dstH = Math.round(src.rows * scale);
+      const dst = new cv.Mat();
+
+      const H_for_warp = new cv.Mat();
+      Hmat.convertTo(H_for_warp, cv.CV_32F); // warpPerspective expects CV_32F or CV_64F
+
+      cv.warpPerspective(src, dst, H_for_warp, new cv.Size(dstW, dstH), cv.INTER_LINEAR, cv.BORDER_CONSTANT, new cv.Scalar());
+
+      // show dst
+      const rectifiedCanvas = document.getElementById('rectifiedCanvas');
+      rectifiedCanvas.width = dstW;
+      rectifiedCanvas.height = dstH;
+      cv.imshow(rectifiedCanvas, dst);
+
+      // cleanup
+      src.delete(); dst.delete(); Hmat.delete(); H_for_warp.delete();
+    } catch (err) {
+      console.error(err);
+      alert('OpenCV warp failed: ' + err);
+    }
+  };
+  </script>
+</body>
+</html>
