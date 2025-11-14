@@ -1,3 +1,3 @@
 # orthophoto
 orthonormal photos
-- [chattest1](https://github.com/cygnyx/orthophoto/blob/main/chattest1.html)
+- [chattest1](chattest1.html)
