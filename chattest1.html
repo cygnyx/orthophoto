@@ -1,0 +1,88 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Photo Rectifier</title>
+<style>
+  body { font-family: sans-serif; margin: 20px; }
+  canvas { border: 1px solid #ccc; margin-top: 10px; }
+</style>
+</head>
+<body>
+<h2>Photo Rectifier (Basic)</h2>
+
+<input type="file" accept="image/*" capture="environment" id="fileInput"><br>
+<button id="rectifyBtn">Rectify Photo</button>
+
+<canvas id="originalCanvas" width="300" height="400"></canvas>
+<canvas id="rectifiedCanvas" width="300" height="400"></canvas>
+
+<script>
+let pitch = 0, roll = 0;
+
+// Request device orientation permission on iOS
+if (typeof DeviceOrientationEvent !== 'undefined' &&
+    typeof DeviceOrientationEvent.requestPermission === 'function') {
+  DeviceOrientationEvent.requestPermission().then(permissionState => {
+    if (permissionState === 'granted') {
+      window.addEventListener('deviceorientation', e => {
+        pitch = e.beta || 0;  // front-back tilt
+        roll  = e.gamma || 0; // side tilt
+      });
+    }
+  });
+} else {
+  window.addEventListener('deviceorientation', e => {
+    pitch = e.beta || 0;
+    roll  = e.gamma || 0;
+  });
+}
+
+const fileInput = document.getElementById('fileInput');
+const originalCanvas = document.getElementById('originalCanvas');
+const rectifiedCanvas = document.getElementById('rectifiedCanvas');
+const origCtx = originalCanvas.getContext('2d');
+const rectCtx = rectifiedCanvas.getContext('2d');
+
+let img = new Image();
+
+fileInput.addEventListener('change', e => {
+  const file = e.target.files[0];
+  if (!file) return;
+  const url = URL.createObjectURL(file);
+  img.src = url;
+});
+
+img.onload = () => {
+  // Draw original
+  origCtx.clearRect(0,0,originalCanvas.width, originalCanvas.height);
+  origCtx.drawImage(img, 0, 0, originalCanvas.width, originalCanvas.height);
+};
+
+// Very simple rectification: shear/rotate based on pitch/roll
+document.getElementById('rectifyBtn').addEventListener('click', () => {
+  rectCtx.clearRect(0,0,rectifiedCanvas.width, rectifiedCanvas.height);
+  
+  // Convert angles to radians
+  const pitchRad = pitch * Math.PI / 180;
+  const rollRad = roll * Math.PI / 180;
+  
+  rectCtx.save();
+  rectCtx.translate(rectifiedCanvas.width/2, rectifiedCanvas.height/2);
+  
+  // Apply roll rotation
+  rectCtx.rotate(-rollRad);
+  
+  // Apply pitch shear approximation
+  const shear = Math.tan(-pitchRad);
+  rectCtx.transform(1, 0, shear, 1, 0, 0);
+  
+  rectCtx.drawImage(img, -rectifiedCanvas.width/2, -rectifiedCanvas.height/2,
+                    rectifiedCanvas.width, rectifiedCanvas.height);
+  rectCtx.restore();
+  
+  alert(`Applied pitch: ${pitch.toFixed(1)}°, roll: ${roll.toFixed(1)}°`);
+});
+</script>
+</body>
+</html>
