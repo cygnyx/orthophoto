@@ -1,0 +1,723 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1.0,viewport-fit=cover" />
+<title>Camera → IndexedDB → Homography Rectify → Save</title>
+<style>
+  :root{font-family:system-ui,-apple-system,Segoe UI, Roboto, "Helvetica Neue", Arial; --accent:#0a84ff;}
+  body{margin:0;padding:0;background:#f6f7fb;color:#111;display:flex;flex-direction:column;min-height:100vh}
+  header{padding:12px;background:#fff;border-bottom:1px solid #e5e7eb;display:flex;gap:12px;align-items:center}
+  header h1{font-size:16px;margin:0}
+  main{padding:12px;flex:1;display:flex;gap:12px;flex-direction:column}
+  .row{display:flex;gap:12px;flex-wrap:wrap}
+  .panel{background:#fff;padding:10px;border-radius:8px;box-shadow:0 1px 2px rgba(0,0,0,.04);flex:1;min-width:260px}
+  #cameraPreview{width:100%;background:#000;aspect-ratio:4/3;display:flex;align-items:center;justify-content:center;position:relative;overflow:hidden;border-radius:6px}
+  video{width:100%;height:100%;object-fit:cover}
+  canvas#captureCanvas{display:none}
+  button{background:var(--accent);color:white;border:0;padding:8px 12px;border-radius:6px;font-size:15px}
+  button.secondary{background:#6b7280}
+  .thumbs{display:flex;gap:8px;flex-wrap:wrap;margin-top:8px}
+  .thumb{width:72px;height:72px;border-radius:6px;overflow:hidden;background:#ddd;display:flex;align-items:center;justify-content:center;position:relative}
+  .thumb img{width:100%;height:100%;object-fit:cover}
+  .viewer{position:relative;background:#222;border-radius:6px;overflow:hidden}
+  .viewer canvas{display:block;width:100%;height:auto;max-height:60vh}
+  .overlay-canvas{position:absolute;left:0;top:0;pointer-events:none}
+  .controls{display:flex;gap:8px;flex-wrap:wrap;margin-top:8px}
+  label.row{display:flex;gap:8px;align-items:center}
+  input[type=range]{width:160px}
+  small.status{display:block;margin-top:6px;color:#444}
+  .point{position:absolute;width:18px;height:18px;border-radius:50%;background:var(--accent);transform:translate(-50%,-50%);box-shadow:0 2px 6px rgba(0,0,0,.25);touch-action:none}
+  .point.handle{background:orange}
+  .muted{color:#666;font-size:13px}
+  footer{padding:10px;text-align:center;font-size:13px;color:#666}
+  @media(min-width:900px){main{flex-direction:row}}
+</style>
+</head>
+<body>
+<header>
+  <h1>Photo Rectifier — Homography</h1>
+  <div style="margin-left:auto" class="muted">Staging uses IndexedDB • Photos saved via share / manual save</div>
+</header>
+
+<main>
+  <div class="panel" style="max-width:420px">
+    <h3>Camera</h3>
+    <div id="cameraPreview">
+      <div style="color:#fff" id="cameraPlaceholder">Camera not started</div>
+      <video id="video" autoplay playsinline></video>
+      <canvas id="captureCanvas"></canvas>
+    </div>
+    <div class="controls">
+      <button id="startCamera">Enable Camera</button>
+      <button id="captureBtn" class="secondary" disabled>Capture</button>
+      <button id="stopCamera" class="secondary" disabled>Stop</button>
+    </div>
+    <small class="status" id="cameraStatus">Camera off</small>
+
+    <h4 style="margin-top:12px">Border (% of image size)</h4>
+    <div class="controls">
+      <label class="row"><input type="range" id="borderRange" min="0" max="20" value="5"> <span id="borderVal">5%</span></label>
+    </div>
+
+    <h4 style="margin-top:12px">Captured Photos</h4>
+    <div class="thumbs" id="thumbs"></div>
+    <small class="muted">Tap a thumbnail to open viewer. Images are kept in the browser until exported/deleted.</small>
+  </div>
+
+  <div class="panel" id="viewerPanel" style="flex:1;min-width:320px;display:flex;flex-direction:column">
+    <h3 id="viewerTitle">Viewer — Select a photo</h3>
+    <div class="viewer" id="viewerArea" style="height:420px;display:flex;align-items:center;justify-content:center">
+      <canvas id="srcCanvas"></canvas>
+      <canvas id="overlayCanvas" class="overlay-canvas"></canvas>
+    </div>
+
+    <div class="controls" style="margin-top:8px">
+      <button id="rectifyBtn" class="secondary" disabled>Rectify (homography)</button>
+      <button id="saveBtn" disabled>Save Rectified → Photos</button>
+      <button id="deleteBtn" class="secondary" disabled>Delete original</button>
+    </div>
+    <small class="status" id="photoInfo">No photo selected</small>
+    <div style="margin-top:10px">
+      <label class="row">Crop border: <span id="curBorderText">5%</span></label>
+      <label class="row">Zoom for editing (pinch/scroll): <span class="muted">Use browser zoom</span></label>
+    </div>
+  </div>
+</main>
+
+<footer>
+  Tip: on iPhone, use Share → Save Image (or long-press the opened image) to add to Photos.
+</footer>
+
+<script>
+/* ------------------------
+   Utilities: IndexedDB wrapper
+   ------------------------ */
+const DB_NAME = 'photo-rectifier-db';
+const STORE = 'photos-v1';
+let dbPromise = null;
+
+function openDb(){
+  if(dbPromise) return dbPromise;
+  dbPromise = new Promise((resolve, reject)=>{
+    const req = indexedDB.open(DB_NAME, 1);
+    req.onupgradeneeded = e => {
+      const db = e.target.result;
+      if(!db.objectStoreNames.contains(STORE)){
+        const st = db.createObjectStore(STORE, {keyPath: 'id', autoIncrement: true});
+        st.createIndex('by_time', 'ts');
+      }
+    };
+    req.onsuccess = e => resolve(e.target.result);
+    req.onerror = e => reject(e.target.error);
+  });
+  return dbPromise;
+}
+
+async function putPhoto(obj){
+  const db = await openDb();
+  return new Promise((res, rej)=>{
+    const tx = db.transaction(STORE,'readwrite');
+    tx.objectStore(STORE).put(obj).onsuccess = ev => res(ev.target.result);
+    tx.oncomplete = ()=>{};
+    tx.onerror = e => rej(e);
+  });
+}
+
+async function getAllPhotos(){
+  const db = await openDb();
+  return new Promise((res,rej)=>{
+    const tx = db.transaction(STORE,'readonly');
+    const cur = tx.objectStore(STORE).getAll();
+    cur.onsuccess = ()=>res(cur.result || []);
+    cur.onerror = e => rej(e);
+  });
+}
+
+async function getPhoto(id){
+  const db = await openDb();
+  return new Promise((res,rej)=>{
+    const tx = db.transaction(STORE,'readonly');
+    const req = tx.objectStore(STORE).get(Number(id));
+    req.onsuccess = ()=>res(req.result);
+    req.onerror = e=>rej(e);
+  });
+}
+
+async function deletePhoto(id){
+  const db = await openDb();
+  return new Promise((res,rej)=>{
+    const tx = db.transaction(STORE,'readwrite');
+    tx.objectStore(STORE).delete(Number(id)).onsuccess = ()=>res();
+    tx.onerror = e=>rej(e);
+  });
+}
+
+/* ------------------------
+   Camera + Capture + Geo
+   ------------------------ */
+const startCameraBtn = document.getElementById('startCamera');
+const stopCameraBtn = document.getElementById('stopCamera');
+const captureBtn = document.getElementById('captureBtn');
+const video = document.getElementById('video');
+const cameraStatus = document.getElementById('cameraStatus');
+let stream = null;
+
+async function startCamera(){
+  try{
+    stream = await navigator.mediaDevices.getUserMedia({video:{facingMode:'environment'}, audio:false});
+    video.srcObject = stream;
+    video.play();
+    cameraStatus.textContent = 'Camera active';
+    startCameraBtn.disabled = true;
+    captureBtn.disabled = false;
+    stopCameraBtn.disabled = false;
+    document.getElementById('cameraPlaceholder').style.display = 'none';
+  }catch(err){
+    console.error(err);
+    cameraStatus.textContent = 'Camera permission denied or not available';
+  }
+}
+async function stopCamera(){
+  if(stream){
+    for(const t of stream.getTracks()) t.stop();
+    stream = null;
+    video.srcObject = null;
+  }
+  cameraStatus.textContent = 'Camera stopped';
+  startCameraBtn.disabled = false;
+  captureBtn.disabled = true;
+  stopCameraBtn.disabled = true;
+  document.getElementById('cameraPlaceholder').style.display = '';
+}
+
+startCameraBtn.addEventListener('click', startCamera);
+stopCameraBtn.addEventListener('click', stopCamera);
+
+const captureCanvas = document.getElementById('captureCanvas');
+
+captureBtn.addEventListener('click', async ()=>{
+  if(!stream) return;
+  // draw current frame to canvas (size of video)
+  const w = video.videoWidth;
+  const h = video.videoHeight;
+  captureCanvas.width = w;
+  captureCanvas.height = h;
+  const ctx = captureCanvas.getContext('2d');
+  ctx.drawImage(video,0,0,w,h);
+  // try to get location
+  let coords = null;
+  try{
+    coords = await new Promise((res,rej)=>{
+      if(!navigator.geolocation) return res(null);
+      const done = pos => res({lat:pos.coords.latitude, lon:pos.coords.longitude, accuracy:pos.coords.accuracy});
+      const fail = err => res(null);
+      navigator.geolocation.getCurrentPosition(done, fail, {maximumAge:30000, timeout:5000});
+    });
+  }catch(e){ coords = null; }
+
+  captureCanvas.toBlob(async blob=>{
+    const obj = {
+      ts: Date.now(),
+      blob,
+      latlon: coords,
+      width: w,
+      height: h
+    };
+    const id = await putPhoto(obj);
+    console.log('saved to indexdb id', id);
+    await refreshThumbs();
+  }, 'image/jpeg', 0.92);
+});
+
+/* ------------------------
+   UI: Thumbnails and viewer
+   ------------------------ */
+const thumbsEl = document.getElementById('thumbs');
+const srcCanvas = document.getElementById('srcCanvas');
+const overlayCanvas = document.getElementById('overlayCanvas');
+const viewerTitle = document.getElementById('viewerTitle');
+const photoInfo = document.getElementById('photoInfo');
+const rectifyBtn = document.getElementById('rectifyBtn');
+const saveBtn = document.getElementById('saveBtn');
+const deleteBtn = document.getElementById('deleteBtn');
+const borderRange = document.getElementById('borderRange');
+const borderVal = document.getElementById('borderVal');
+const curBorderText = document.getElementById('curBorderText');
+
+let currentPhotoId = null;
+let currentImage = null; // Image object
+let displayScale = 1;
+let quad = null; // [{x,y} x4] in canvas coordinates
+
+borderRange.addEventListener('input', ()=>{
+  borderVal.textContent = borderRange.value + '%';
+  curBorderText.textContent = borderRange.value + '%';
+});
+
+async function refreshThumbs(){
+  const photos = await getAllPhotos();
+  thumbsEl.innerHTML = '';
+  photos.sort((a,b)=>b.ts - a.ts);
+  for(const p of photos){
+    const url = URL.createObjectURL(p.blob);
+    const div = document.createElement('div');
+    div.className = 'thumb';
+    const img = document.createElement('img');
+    img.src = url;
+    div.appendChild(img);
+    div.addEventListener('click', ()=>openViewer(p.id));
+    thumbsEl.appendChild(div);
+  }
+}
+
+async function openViewer(id){
+  const p = await getPhoto(id);
+  if(!p) return;
+  currentPhotoId = id;
+  viewerTitle.textContent = `Viewer — Photo #${id}`;
+  photoInfo.textContent = `Captured: ${new Date(p.ts).toLocaleString()} ${p.latlon? '• GPS: ' + p.latlon.lat.toFixed(6)+','+p.latlon.lon.toFixed(6) : ''}`;
+  rectifyBtn.disabled = false;
+  saveBtn.disabled = true;
+  deleteBtn.disabled = false;
+
+  const url = URL.createObjectURL(p.blob);
+  const img = new Image();
+  img.onload = () => {
+    currentImage = {img, width: img.naturalWidth, height: img.naturalHeight};
+    fitCanvasToImage();
+    initQuadToImage();
+    drawImageAndOverlay();
+  };
+  img.src = url;
+}
+
+function fitCanvasToImage(){
+  // fit srcCanvas to viewerArea width
+  const viewerArea = document.getElementById('viewerArea');
+  const areaW = viewerArea.clientWidth;
+  const areaH = viewerArea.clientHeight;
+  const iw = currentImage.width, ih = currentImage.height;
+  let scale = Math.min(areaW/iw, areaH/ih, 1);
+  // allow scaling up if small images? Keep <=1 for performance
+  displayScale = scale;
+  srcCanvas.width = Math.round(iw * displayScale);
+  srcCanvas.height = Math.round(ih * displayScale);
+  overlayCanvas.width = srcCanvas.width;
+  overlayCanvas.height = srcCanvas.height;
+  srcCanvas.style.width = srcCanvas.width + 'px';
+  srcCanvas.style.height = srcCanvas.height + 'px';
+  overlayCanvas.style.left = srcCanvas.offsetLeft + 'px';
+  overlayCanvas.style.top = srcCanvas.offsetTop + 'px';
+}
+
+function initQuadToImage(){
+  // initialize quad to image corners (scaled)
+  const w = srcCanvas.width, h = srcCanvas.height;
+  quad = [
+    {x: 20, y: 20},          // top-left (a bit inset)
+    {x: w - 20, y: 20},      // top-right
+    {x: w - 20, y: h - 20},  // bottom-right
+    {x: 20, y: h - 20}       // bottom-left
+  ];
+  makePointHandles();
+}
+
+function drawImageAndOverlay(){
+  // draw image to srcCanvas (scaled)
+  const ctx = srcCanvas.getContext('2d');
+  ctx.clearRect(0,0,srcCanvas.width,srcCanvas.height);
+  ctx.drawImage(currentImage.img, 0, 0, currentImage.width, currentImage.height, 0,0,srcCanvas.width,srcCanvas.height);
+
+  // overlay
+  const octx = overlayCanvas.getContext('2d');
+  octx.clearRect(0,0,overlayCanvas.width, overlayCanvas.height);
+
+  // draw polygon lines in contrasting color
+  octx.lineWidth = 3;
+  octx.strokeStyle = 'orange';
+  octx.beginPath();
+  for(let i=0;i<4;i++){
+    const p = quad[i];
+    if(i===0) octx.moveTo(p.x, p.y); else octx.lineTo(p.x, p.y);
+  }
+  octx.closePath();
+  octx.stroke();
+
+  // draw semi-transparent fill
+  octx.fillStyle = 'rgba(255,165,0,0.06)';
+  octx.fill();
+
+  // draw handles are DOM elements (see makePointHandles)
+  updateHandlePositions();
+}
+
+/* ------------------------
+   Draggable point handles (DOM) to allow touch drag
+   ------------------------ */
+const viewerArea = document.getElementById('viewerArea');
+let handles = [];
+function makePointHandles(){
+  // clear old
+  for(const h of handles) h.remove();
+  handles = [];
+  for(let i=0;i<4;i++){
+    const el = document.createElement('div');
+    el.className = 'point';
+    el.dataset.idx = i;
+    el.style.left = quad[i].x + 'px';
+    el.style.top = quad[i].y + 'px';
+    viewerArea.appendChild(el);
+    handles.push(el);
+
+    // drag handling (pointer events)
+    el.addEventListener('pointerdown', onPointerDown);
+    el.addEventListener('touchstart', e=>e.preventDefault(), {passive:false});
+  }
+}
+
+let activeHandle = null;
+function onPointerDown(e){
+  e.preventDefault();
+  const el = e.currentTarget;
+  const idx = Number(el.dataset.idx);
+  activeHandle = {el, idx};
+  el.setPointerCapture(e.pointerId);
+  const move = (ev)=>{
+    const rect = srcCanvas.getBoundingClientRect();
+    let x = ev.clientX - rect.left;
+    let y = ev.clientY - rect.top;
+    // clamp
+    x = Math.max(0, Math.min(srcCanvas.width, x));
+    y = Math.max(0, Math.min(srcCanvas.height, y));
+    quad[idx].x = x;
+    quad[idx].y = y;
+    drawImageAndOverlay();
+  };
+  const up = (ev)=>{
+    el.releasePointerCapture(e.pointerId);
+    document.removeEventListener('pointermove', move);
+    document.removeEventListener('pointerup', up);
+    activeHandle = null;
+  };
+  document.addEventListener('pointermove', move);
+  document.addEventListener('pointerup', up);
+}
+
+function updateHandlePositions(){
+  for(let i=0;i<handles.length;i++){
+    const el = handles[i];
+    el.style.left = quad[i].x + 'px';
+    el.style.top = quad[i].y + 'px';
+  }
+}
+
+/* ------------------------
+   Homography math + warp (inverse-mapping with bilinear sampling)
+   ------------------------ */
+// compute 3x3 homography H such that for src pts (xi,yi) -> dst pts (ui,vi)
+// We'll compute H mapping src->dst using linear solve (8 equations)
+function computeHomography(src, dst){
+  // src & dst arrays of 4 points {x,y}
+  // Solve A * h = b for 8 unknowns (h33=1)
+  // Build 8x8 matrix and 8x1 vector
+  const A = []; const b = [];
+  for(let i=0;i<4;i++){
+    const xs = src[i].x, ys = src[i].y;
+    const xd = dst[i].x, yd = dst[i].y;
+    A.push([xs, ys, 1,   0,  0, 0,   -xs*xd, -ys*xd]);
+    b.push(xd);
+    A.push([0,0,0,   xs, ys, 1,   -xs*yd, -ys*yd]);
+    b.push(yd);
+  }
+  // Gaussian elimination solve A h = b
+  // convert to augmented matrix
+  const M = A.map((row,i)=>row.concat([b[i]]));
+  const n = 8;
+  for(let i=0;i<n;i++){
+    // pivot
+    let maxr = i;
+    for(let r=i+1;r<n;r++){
+      if(Math.abs(M[r][i]) > Math.abs(M[maxr][i])) maxr = r;
+    }
+    if(Math.abs(M[maxr][i]) < 1e-12) continue;
+    if(maxr !== i){ const t = M[i]; M[i]=M[maxr]; M[maxr]=t; }
+    // normalize
+    const diag = M[i][i];
+    for(let c=i;c<=n;c++) M[i][c] /= diag;
+    // eliminate
+    for(let r=0;r<n;r++){
+      if(r===i) continue;
+      const fac = M[r][i];
+      if(Math.abs(fac) < 1e-15) continue;
+      for(let c=i;c<=n;c++) M[r][c] -= fac * M[i][c];
+    }
+  }
+  const h = new Array(9).fill(0);
+  for(let i=0;i<8;i++) h[i] = M[i][n];
+  h[8] = 1;
+  // return 3x3 matrix as array row-major
+  return [
+    [h[0], h[1], h[2]],
+    [h[3], h[4], h[5]],
+    [h[6], h[7], h[8]]
+  ];
+}
+function invert3x3(m){
+  const a=m[0][0], b=m[0][1], c=m[0][2];
+  const d=m[1][0], e=m[1][1], f=m[1][2];
+  const g=m[2][0], h=m[2][1], i=m[2][2];
+  const A = e*i - f*h;
+  const B = -(d*i - f*g);
+  const C = d*h - e*g;
+  const D = -(b*i - c*h);
+  const E = a*i - c*g;
+  const F = -(a*h - b*g);
+  const G = b*f - c*e;
+  const H = -(a*f - c*d);
+  const I = a*e - b*d;
+  const det = a*A + b*B + c*C;
+  if(Math.abs(det) < 1e-15) return null;
+  const invDet = 1/det;
+  return [
+    [A*invDet, D*invDet, G*invDet],
+    [B*invDet, E*invDet, H*invDet],
+    [C*invDet, F*invDet, I*invDet]
+  ];
+}
+
+// bilinear sample from srcImageData (Uint8ClampedArray), width, height
+function bilinearSample(data, sw, sh, x, y){
+  if(x < 0 || x >= sw-1 || y < 0 || y >= sh-1) {
+    // clamp
+    const xi = Math.max(0, Math.min(sw-1, Math.round(x)));
+    const yi = Math.max(0, Math.min(sh-1, Math.round(y)));
+    const idx = (yi*sw + xi) * 4;
+    return [data[idx], data[idx+1], data[idx+2], data[idx+3]];
+  }
+  const x0 = Math.floor(x), y0 = Math.floor(y);
+  const dx = x - x0, dy = y - y0;
+  const i00 = (y0*sw + x0)*4;
+  const i10 = (y0*sw + (x0+1))*4;
+  const i01 = ((y0+1)*sw + x0)*4;
+  const i11 = ((y0+1)*sw + (x0+1))*4;
+  const out = [0,0,0,0];
+  for(let c=0;c<4;c++){
+    const v00 = data[i00 + c], v10 = data[i10 + c], v01 = data[i01 + c], v11 = data[i11 + c];
+    const v0 = v00*(1-dx) + v10*dx;
+    const v1 = v01*(1-dx) + v11*dx;
+    out[c] = v0*(1-dy) + v1*dy;
+  }
+  return out;
+}
+
+// warp using inverse homography: dest (W x H) -> source
+async function warpImageWithHomography(srcImg, srcW, srcH, dstW, dstH, Hinv){
+  // draw source to offscreen canvas to access pixels
+  const tmp = document.createElement('canvas');
+  tmp.width = srcW; tmp.height = srcH;
+  const tctx = tmp.getContext('2d');
+  tctx.drawImage(srcImg, 0, 0, srcW, srcH);
+  const srcData = tctx.getImageData(0,0,srcW,srcH).data;
+
+  const dst = document.createElement('canvas');
+  dst.width = dstW; dst.height = dstH;
+  const dctx = dst.getContext('2d');
+  const outImg = dctx.createImageData(dstW, dstH);
+  const outData = outImg.data;
+
+  // for each destination pixel (u,v), compute corresponding source (x,y)
+  for(let v=0; v<dstH; v++){
+    for(let u=0; u<dstW; u++){
+      const idx = (v*dstW + u)*4;
+      // apply inverse homography: [x y w]^T = Hinv * [u v 1]^T
+      const X = Hinv[0][0]*u + Hinv[0][1]*v + Hinv[0][2];
+      const Y = Hinv[1][0]*u + Hinv[1][1]*v + Hinv[1][2];
+      const W = Hinv[2][0]*u + Hinv[2][1]*v + Hinv[2][2];
+      const sx = X / W;
+      const sy = Y / W;
+      const pix = bilinearSample(srcData, srcW, srcH, sx, sy);
+      outData[idx] = pix[0];
+      outData[idx+1] = pix[1];
+      outData[idx+2] = pix[2];
+      outData[idx+3] = pix[3];
+    }
+    // small progress break for UI responsiveness
+    if((v & 31) === 0) await new Promise(r=>setTimeout(r,0));
+  }
+
+  dctx.putImageData(outImg,0,0);
+  return dst;
+}
+
+/* ------------------------
+   Apply border param and compute destination rectangle
+   ------------------------ */
+function quadBounds(q){
+  let minx=Infinity,miny=Infinity,maxx=-Infinity,maxy=-Infinity;
+  for(const p of q){ if(p.x<minx) minx=p.x; if(p.y<miny) miny=p.y; if(p.x>maxx) maxx=p.x; if(p.y>maxy) maxy=p.y; }
+  return {minx,miny,maxx,maxy,width:maxx-minx,height:maxy-miny};
+}
+
+async function rectifyCurrent(){
+  if(!currentImage || !quad) return;
+  // Map quad (in displayed canvas coords) back to source image pixel coords (full resolution)
+  const scale = currentImage.width / srcCanvas.width;
+  const srcPts = quad.map(p => ({x: p.x * scale, y: p.y * scale}));
+
+  // Compute border param (percentage of image size)
+  const pct = Number(borderRange.value) / 100.0;
+  // compute bounding box and expand
+  const b = quadBounds(srcPts);
+  const padX = b.width * pct;
+  const padY = b.height * pct;
+  // create destination rectangle size based on bounding box plus borders
+  // We'll set destination width/height proportional to the bounding box aspect ratio
+  const dstW = Math.round(b.width + 2*padX);
+  const dstH = Math.round(b.height + 2*padY);
+
+  // Destination rectangle corners (order: TL, TR, BR, BL)
+  const dstPts = [
+    {x: 0, y: 0},
+    {x: dstW - 1, y: 0},
+    {x: dstW - 1, y: dstH - 1},
+    {x: 0, y: dstH - 1}
+  ];
+
+  // But we want the homography to map srcPts -> dstPts after accounting for border offset.
+  // So subtract (minx - padX, miny - padY) from srcPts to normalize
+  const offsetX = b.minx - padX;
+  const offsetY = b.miny - padY;
+  const normalizedSrc = srcPts.map(p => ({x: p.x - offsetX, y: p.y - offsetY}));
+
+  // compute homography H mapping normalizedSrc -> dstPts
+  const H = computeHomography(normalizedSrc, dstPts);
+  const Hinv = invert3x3(H);
+  if(!Hinv) throw new Error('Homography not invertible');
+
+  // create a temporary scaled down source image if huge for performance
+  const MAX_SIDE = 3000; // safeguard
+  let srcCanvasForWarp = document.createElement('canvas');
+  let srcW = currentImage.width, srcH = currentImage.height;
+  if(Math.max(srcW, srcH) > MAX_SIDE){
+    const scaleDown = MAX_SIDE / Math.max(srcW, srcH);
+    srcCanvasForWarp.width = Math.round(srcW * scaleDown);
+    srcCanvasForWarp.height = Math.round(srcH * scaleDown);
+    const cctx = srcCanvasForWarp.getContext('2d');
+    cctx.drawImage(currentImage.img, 0, 0, srcW, srcH, 0, 0, srcCanvasForWarp.width, srcCanvasForWarp.height);
+    // we must adjust Hinv to work with scaled source coordinates (we scaled src by scaleDown)
+    // Because we sampled source coordinates in pixel units, if we scale the source image, we should scale Hinv inputs accordingly.
+    // We'll compensate by multiplying Hinv's translation terms appropriately. Simpler approach:
+    // We'll pass the original image plus compute mapping using original source - but that is memory heavy.
+    // For now we will use the original high-res to preserve quality unless too large. (we handled via MAX_SIDE)
+    srcW = srcCanvasForWarp.width; srcH = srcCanvasForWarp.height;
+    // NOTE: we should scale normalizedSrc as well; but to avoid complexity, skip heavy scaling for now.
+  } else {
+    srcCanvasForWarp.width = srcW;
+    srcCanvasForWarp.height = srcH;
+    const cctx = srcCanvasForWarp.getContext('2d');
+    cctx.drawImage(currentImage.img, 0, 0, srcW, srcH);
+  }
+
+  // Because we normalized srcPts by subtracting offsetX/Y, our H maps from normalizedSrc coords to dst coords.
+  // But our warp function expects a mapping from destination pixel (u,v) -> source absolute pixel coords.
+  // Hinv currently maps dst -> normalizedSrc. So to get absolute source coords, we must add offsetX/offsetY back.
+  // We implement inverse mapping inside warp loop by applying Hinv then adding offset.
+
+  // Create a wrapper Hinv' that returns absolute source coords:
+  const HinvAdj = [
+    [Hinv[0][0], Hinv[0][1], Hinv[0][2] + Hinv[0][0]*offsetX + Hinv[0][1]*offsetY],
+    [Hinv[1][0], Hinv[1][1], Hinv[1][2] + Hinv[1][0]*offsetX + Hinv[1][1]*offsetY],
+    [Hinv[2][0], Hinv[2][1], Hinv[2][2] + Hinv[2][0]*offsetX + Hinv[2][1]*offsetY]
+  ];
+
+  // Because we used the actual currentImage.img size in source canvas, use that full resolution
+  // For simplicity and to avoid re-sampling complications, draw source to a canvas of full size:
+  const fullSrcCanvas = document.createElement('canvas');
+  fullSrcCanvas.width = currentImage.width;
+  fullSrcCanvas.height = currentImage.height;
+  fullSrcCanvas.getContext('2d').drawImage(currentImage.img, 0, 0, currentImage.width, currentImage.height);
+
+  // Warp using HinvAdj
+  // But warpImageWithHomography expects Hinv that maps dst->src absolute coords.
+  const HinvFinal = HinvAdj;
+  const resultCanvas = await warpImageWithHomography(fullSrcCanvas, currentImage.width, currentImage.height, dstW, dstH, HinvFinal);
+
+  // show result in a new window for user to save or use navigator.share
+  return resultCanvas;
+}
+
+/* ------------------------
+   Save / Share / Delete flow
+   ------------------------ */
+rectifyBtn.addEventListener('click', async ()=>{
+  rectifyBtn.disabled = true;
+  photoInfo.textContent = 'Rectifying — please wait...';
+  try{
+    const outCanvas = await rectifyCurrent();
+    // show result in a new tab and enable save
+    const dataUrl = outCanvas.toDataURL('image/jpeg', 0.96);
+    // show preview in a new window for iOS long-press saving
+    const w = window.open(dataUrl, '_blank');
+    // also enable Save button using share
+    saveBtn.disabled = false;
+    saveBtn.onclick = async ()=>{
+      // try navigator.share with files if available
+      try{
+        const blob = await new Promise(r=>outCanvas.toBlob(r, 'image/jpeg', 0.96));
+        const file = new File([blob], `rectified-${Date.now()}.jpg`, {type:'image/jpeg'});
+        if(navigator.canShare && navigator.canShare({files:[file]})){
+          await navigator.share({files:[file], title:'Rectified Image'});
+          // assume user saved via share sheet: delete original from indexeddb
+          await deletePhoto(currentPhotoId);
+          await refreshThumbs();
+          photoInfo.textContent = 'Saved via share sheet — original deleted from storage.';
+          rectifyBtn.disabled = false;
+          saveBtn.disabled = true;
+          deleteBtn.disabled = true;
+          return;
+        } else {
+          // fallback - open data url and instruct user to long-press Save Image
+          window.open(URL.createObjectURL(blob));
+          photoInfo.textContent = 'Opened image in a new tab. Long-press and choose "Save Image" to add to Photos.';
+          // cannot detect if user saved -> ask for manual deletion
+        }
+      }catch(err){
+        console.error(err);
+        alert('Share failed — opened fallback. You can long-press the opened image to Save Image.');
+      }
+    };
+    photoInfo.textContent = 'Rectified — use Save Rectified → Photos to export.';
+  }catch(err){
+    console.error(err);
+    photoInfo.textContent = 'Rectify failed: ' + err.message;
+  } finally {
+    rectifyBtn.disabled = false;
+  }
+});
+
+deleteBtn.addEventListener('click', async ()=>{
+  if(!currentPhotoId) return;
+  if(!confirm('Delete original photo from the browser storage? This cannot be undone.')) return;
+  await deletePhoto(currentPhotoId);
+  currentPhotoId = null;
+  currentImage = null;
+  srcCanvas.getContext('2d').clearRect(0,0,srcCanvas.width,srcCanvas.height);
+  overlayCanvas.getContext('2d').clearRect(0,0,overlayCanvas.width,overlayCanvas.height);
+  rectifyBtn.disabled = true; saveBtn.disabled = true; deleteBtn.disabled = true;
+  viewerTitle.textContent = 'Viewer — Select a photo';
+  photoInfo.textContent = 'Original deleted';
+  await refreshThumbs();
+});
+
+/* ------------------------
+   Initial load
+   ------------------------ */
+(async ()=>{
+  await refreshThumbs();
+  borderVal.textContent = borderRange.value + '%';
+  curBorderText.textContent = borderRange.value + '%';
+})();
+</script>
+</body>
+</html>
