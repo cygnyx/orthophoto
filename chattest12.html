@@ -1,0 +1,899 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>Rectifier — IndexedDB + Camera + Homography</title>
+<style>
+  body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Arial; margin: 12px; color:#111; }
+  header { display:flex; gap:8px; align-items:center; margin-bottom:8px; }
+  button { padding:8px 12px; border-radius:8px; border:1px solid #ccc; background:#fff; }
+  #canvasWrap { position:relative; display:inline-block; border:1px solid #ddd; }
+  canvas { display:block; max-width:100%; height:auto; }
+  .overlay {
+    position:absolute; left:0; top:0; right:0; bottom:0; pointer-events:none;
+  }
+  .controls { margin-top:8px; display:flex; gap:8px; flex-wrap:wrap; }
+  label { font-size:14px; }
+  input[type="range"] { width:160px; }
+  #messages { margin-top:8px; font-size:13px; color:#444; }
+  #rectified { margin-top:12px; }
+  .info { font-size:13px; color:#333; margin-top:6px; }
+  .crosshair { position:absolute; width:0; height:0; pointer-events:auto; }
+  .hit-area { position:absolute; border-radius:12px; transform:translate(-50%,-50%); background:transparent; pointer-events:auto; }
+  /* Visual styles of lines and crosshairs drawn on overlay canvas; overlay canvas used for rendering */
+  .big { font-weight:600; }
+</style>
+</head>
+<body>
+<header>
+  <button id="enableCameraBtn">Enable Camera</button>
+  <input id="fileInput" type="file" accept="image/*" capture="environment" style="display:none">
+  <button id="captureBtn" disabled>Capture</button>
+  <button id="savePhotoBtn" disabled>Save Rectified → Photos</button>
+  <button id="exportZipBtn">Export All ZIP</button>
+  <button id="deleteBtn" disabled>Delete Loaded</button>
+</header>
+
+<div class="controls">
+  <label>Border %: <input id="borderRange" type="range" min="0" max="40" value="10"> <span id="borderVal">10%</span></label>
+  <label>Stored photos: <span id="storedCount">0</span></label>
+</div>
+
+<div id="canvasWrap">
+  <canvas id="origCanvas"></canvas>
+  <canvas id="overlayCanvas" class="overlay"></canvas>
+</div>
+
+<div id="rectified">
+  <h3 class="big">Rectified image</h3>
+  <canvas id="rectCanvas"></canvas>
+</div>
+
+<div class="info" id="metaInfo"></div>
+<div id="messages"></div>
+
+<!-- JSZip CDN for zip export -->
+<script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
+<script>
+/*
+  Rectifier webapp
+  - IndexedDB store for original photos (one at a time)
+  - Camera capture
+  - Overlay with 4 draggable crosshair control points (with larger touch hit zones)
+  - Full homography rectification: dest is a rectangle (tight bounding rect expanded by border%)
+  - GPS from EXIF if present, fallback to navigator.geolocation
+  - Save via navigator.share (if supports files) or via download link; delete from DB after successful save
+  - Export all as ZIP
+*/
+
+/////////////////////////
+// Simple IndexedDB wrapper
+const DB_NAME = 'rectify-db-v1';
+const STORE_ORIG = 'origPhotos';
+let dbPromise = null;
+function openDb() {
+  if (dbPromise) return dbPromise;
+  dbPromise = new Promise((res, rej) => {
+    const r = indexedDB.open(DB_NAME, 1);
+    r.onupgradeneeded = e => {
+      const db = e.target.result;
+      if (!db.objectStoreNames.contains(STORE_ORIG)) {
+        db.createObjectStore(STORE_ORIG, { keyPath: 'id' });
+      }
+    };
+    r.onsuccess = e => res(e.target.result);
+    r.onerror = e => rej(e.target.error);
+  });
+  return dbPromise;
+}
+async function putOrig(item) {
+  const db = await openDb();
+  return new Promise((res, rej) => {
+    const tx = db.transaction(STORE_ORIG, 'readwrite');
+    tx.objectStore(STORE_ORIG).put(item);
+    tx.oncomplete = () => res();
+    tx.onerror = e => rej(e.target.error);
+  });
+}
+async function getAllOrig() {
+  const db = await openDb();
+  return new Promise((res, rej) => {
+    const tx = db.transaction(STORE_ORIG, 'readonly');
+    const req = tx.objectStore(STORE_ORIG).getAll();
+    req.onsuccess = () => res(req.result);
+    req.onerror = e => rej(e.target.error);
+  });
+}
+async function getOrig(id) {
+  const db = await openDb();
+  return new Promise((res, rej) => {
+    const tx = db.transaction(STORE_ORIG, 'readonly');
+    const req = tx.objectStore(STORE_ORIG).get(id);
+    req.onsuccess = () => res(req.result);
+    req.onerror = e => rej(e.target.error);
+  });
+}
+async function deleteOrig(id) {
+  const db = await openDb();
+  return new Promise((res, rej) => {
+    const tx = db.transaction(STORE_ORIG, 'readwrite');
+    const req = tx.objectStore(STORE_ORIG).delete(id);
+    req.onsuccess = () => res();
+    req.onerror = e => rej(e.target.error);
+  });
+}
+
+/////////////////////////
+// DOM refs
+const enableCameraBtn = document.getElementById('enableCameraBtn');
+const fileInput = document.getElementById('fileInput');
+const captureBtn = document.getElementById('captureBtn');
+const savePhotoBtn = document.getElementById('savePhotoBtn');
+const exportZipBtn = document.getElementById('exportZipBtn');
+const deleteBtn = document.getElementById('deleteBtn');
+
+const origCanvas = document.getElementById('origCanvas');
+const overlayCanvas = document.getElementById('overlayCanvas');
+const rectCanvas = document.getElementById('rectCanvas');
+const borderRange = document.getElementById('borderRange');
+const borderVal = document.getElementById('borderVal');
+const storedCount = document.getElementById('storedCount');
+const metaInfo = document.getElementById('metaInfo');
+const messages = document.getElementById('messages');
+
+const overlayCtx = overlayCanvas.getContext('2d');
+const origCtx = origCanvas.getContext('2d');
+const rectCtx = rectCanvas.getContext('2d');
+
+let currentBlob = null;
+let currentId = null;
+let currentImage = new Image();
+let currentExifGPS = null;
+let currentGeo = null;
+let currentPoints = []; // [ {x,y} * 4 ] in canvas coords (origCanvas space)
+let outerHandles = []; // positions for hit areas (bigger than crosshair) - same length as points
+const crosshairSize = 14; // crosshair visual size
+const outerHandleRadius = 28; // bigger touch area
+let draggingIndex = -1;
+let devicePixelRatio_ = window.devicePixelRatio || 1;
+
+borderVal.textContent = borderRange.value + '%';
+borderRange.oninput = () => {
+  borderVal.textContent = borderRange.value + '%';
+  if (currentImage && currentPoints.length===4) {
+    redrawOverlay();
+    computeAndDrawRectified();
+  }
+};
+
+// Enable camera: simply triggers the file input (with capture)
+enableCameraBtn.addEventListener('click', () => {
+  // on iOS, showing the camera requires user gesture; file input with capture="environment" will open camera
+  fileInput.click();
+});
+
+// When file selected or photographed
+fileInput.addEventListener('change', async (ev) => {
+  const f = ev.target.files && ev.target.files[0];
+  if (!f) return;
+  // assign id
+  currentId = 'img-' + Date.now();
+  currentBlob = f;
+  // store in IndexedDB (original)
+  const item = {
+    id: currentId,
+    blob: f,
+    timestamp: Date.now()
+  };
+  await putOrig(item);
+  updateStoredCount();
+  captureBtn.disabled = false;
+  // auto-load this image into view (same as pressing Capture)
+  loadBlobToCanvas(f);
+});
+
+// Capture button: load the stored blob into workspace (there's only one loaded at a time)
+captureBtn.addEventListener('click', async () => {
+  if (!currentBlob) {
+    showMsg('No photo loaded. Use Enable Camera to capture.');
+    return;
+  }
+  // Already stored in DB; just load
+  loadBlobToCanvas(currentBlob);
+  savePhotoBtn.disabled = false;
+  deleteBtn.disabled = false;
+});
+
+// Save rectified image to Photos (share) and delete original from IndexedDB after success
+savePhotoBtn.addEventListener('click', async () => {
+  if (!currentImage || currentPoints.length !== 4) return showMsg('No image loaded.');
+  showMsg('Preparing rectified image for save...');
+  const blob = await rectCanvasToBlob(rectCanvas, 0.92);
+  // attach GPS metadata text file along with image (optional)
+  let files = [];
+  const fileName = (currentId || 'rect') + '.jpg';
+  files.push( new File([blob], fileName, { type: 'image/jpeg' }) );
+  // add a small .json with GPS if present
+  const gps = currentExifGPS || currentGeo || null;
+  if (gps) {
+    const json = new Blob([JSON.stringify({ gps })], { type: 'application/json' });
+    files.push(new File([json], (currentId||'rect') + '-gps.json', { type: 'application/json' }));
+  }
+  // Try Web Share API with files
+  let shared = false;
+  try {
+    if (navigator.canShare && navigator.canShare({ files })) {
+      await navigator.share({ files, title: 'Rectified photo' });
+      shared = true;
+    } else if (navigator.share && files.length===1) {
+      // older support: share a single file via data URL fallback
+      await navigator.share({ files, title: 'Rectified photo' });
+      shared = true;
+    }
+  } catch (err) {
+    console.warn('share failed', err);
+    shared = false;
+  }
+
+  if (!shared) {
+    // fallback: download the image so the user can save it manually (Safari downloads to Files)
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = fileName;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(url);
+    showMsg('Downloaded rectified image. To save to Photos, open the image in Files or Safari and choose "Save Image".');
+  } else {
+    showMsg('Shared image via share sheet. If you chose "Save Image", it will be in Photos.');
+  }
+
+  // delete original from IndexedDB (best-effort) as user requested
+  if (currentId) {
+    try {
+      await deleteOrig(currentId);
+      showMsg((shared? 'Shared and' : 'Downloaded and') + ' deleted original from storage.');
+      currentBlob = null;
+      currentId = null;
+      updateStoredCount();
+      savePhotoBtn.disabled = true;
+      deleteBtn.disabled = true;
+    } catch (e) {
+      console.warn('delete failed', e);
+      showMsg('Could not delete original from storage: ' + e);
+    }
+  }
+});
+
+// Delete loaded (original) photo from DB without saving
+deleteBtn.addEventListener('click', async () => {
+  if (!currentId) return;
+  await deleteOrig(currentId);
+  currentBlob = null;
+  currentId = null;
+  currentImage = new Image();
+  clearCanvases();
+  updateStoredCount();
+  showMsg('Deleted loaded photo from storage.');
+  savePhotoBtn.disabled = true;
+  deleteBtn.disabled = true;
+});
+
+exportZipBtn.addEventListener('click', async () => {
+  showMsg('Preparing ZIP of rectified images...');
+  const all = await getAllOrig();
+  if (!all.length) return showMsg('No stored photos to export.');
+  const zip = new JSZip();
+  for (let i=0;i<all.length;i++) {
+    const item = all[i];
+    // For each original, load into Image, use default rectangle (center rect) to rectify
+    const blob = item.blob;
+    const img = await blobToImage(blob);
+    // choose center smaller rect default
+    const pts = defaultPointsForImage(img);
+    const {canvas: outCanvas} = await rectifiedCanvasFromImageAndPoints(img, pts, parseFloat(borderRange.value)/100);
+    const data = await new Promise(r => outCanvas.toBlob(r, 'image/jpeg', 0.9));
+    zip.file((item.id || 'img') + '.jpg', data);
+  }
+  const content = await zip.generateAsync({type:'blob'});
+  const url = URL.createObjectURL(content);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = 'rectified_photos.zip';
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  URL.revokeObjectURL(url);
+  showMsg('ZIP downloaded. You can import images from it to Photos via Files or using your computer.');
+});
+
+function showMsg(s) {
+  messages.textContent = s;
+}
+
+async function updateStoredCount() {
+  const all = await getAllOrig();
+  storedCount.textContent = all.length;
+}
+
+// helper: convert canvas to blob promise
+function rectCanvasToBlob(canvas, quality=0.92) {
+  return new Promise(res => canvas.toBlob(res, 'image/jpeg', quality));
+}
+
+// helper: blob -> Image
+function blobToImage(blob) {
+  return new Promise((res,reject) => {
+    const url = URL.createObjectURL(blob);
+    const img = new Image();
+    img.onload = () => {
+      URL.revokeObjectURL(url);
+      res(img);
+    };
+    img.onerror = (e) => { URL.revokeObjectURL(url); reject(e); };
+    img.src = url;
+    // iOS images may require crossOrigin none; default is fine
+  });
+}
+
+function clearCanvases() {
+  origCtx.clearRect(0,0,origCanvas.width, origCanvas.height);
+  overlayCtx.clearRect(0,0,overlayCanvas.width, overlayCanvas.height);
+  rectCtx.clearRect(0,0,rectCanvas.width, rectCanvas.height);
+  metaInfo.textContent = '';
+}
+
+/////////////////////////
+// Load blob into main canvas and initialize control points
+async function loadBlobToCanvas(blob) {
+  currentBlob = blob;
+  currentImage = await blobToImage(blob);
+
+  // canvas sizing using devicePixelRatio to retain quality
+  const maxWidth = Math.min(window.innerWidth - 24, currentImage.width);
+  const scale = Math.min(1, maxWidth / currentImage.width);
+  const w = Math.round(currentImage.width * scale);
+  const h = Math.round(currentImage.height * scale);
+
+  origCanvas.width = Math.round(w * devicePixelRatio_);
+  origCanvas.height = Math.round(h * devicePixelRatio_);
+  origCanvas.style.width = w + 'px';
+  origCanvas.style.height = h + 'px';
+
+  overlayCanvas.width = origCanvas.width;
+  overlayCanvas.height = origCanvas.height;
+  overlayCanvas.style.width = origCanvas.style.width;
+  overlayCanvas.style.height = origCanvas.style.height;
+
+  // draw image onto canvas (scale up by DPR)
+  origCtx.setTransform(devicePixelRatio_,0,0,devicePixelRatio_,0,0);
+  origCtx.clearRect(0,0,w,h);
+  origCtx.drawImage(currentImage, 0, 0, w, h);
+
+  // default points (smaller rectangle centered)
+  currentPoints = defaultPointsForCanvas(w, h);
+  outerHandles = currentPoints.map(p => ({x:p.x, y:p.y}));
+  // attempt to extract EXIF GPS
+  currentExifGPS = await extractGPSFromBlobEXIF(blob).catch(()=>null);
+  if (!currentExifGPS && navigator.geolocation) {
+    // best-effort geolocation fallback
+    navigator.geolocation.getCurrentPosition(pos => {
+      currentGeo = { latitude: pos.coords.latitude, longitude: pos.coords.longitude, accuracy: pos.coords.accuracy };
+      updateMetaInfo();
+    }, err => {
+      currentGeo = null;
+    }, { timeout:5000, maximumAge:60000 });
+  }
+  updateMetaInfo();
+  redrawOverlay();
+  computeAndDrawRectified();
+  savePhotoBtn.disabled = false;
+  deleteBtn.disabled = false;
+}
+
+function updateMetaInfo() {
+  let t = '';
+  if (currentExifGPS) t += 'GPS from EXIF: ' + JSON.stringify(currentExifGPS) + '\n';
+  else if (currentGeo) t += 'GPS from navigator.geolocation: ' + JSON.stringify(currentGeo) + '\n';
+  metaInfo.textContent = t;
+}
+
+function defaultPointsForCanvas(w, h) {
+  // smaller default rectangle centered (the user requested "Make the default rectangle smaller")
+  // use 60% of min dimension as rect size
+  const marginFactor = 0.2; // leave 20% margins
+  const left = w * marginFactor;
+  const top = h * marginFactor;
+  const right = w * (1 - marginFactor);
+  const bottom = h * (1 - marginFactor);
+  return [
+    { x: left, y: top },
+    { x: right, y: top },
+    { x: right, y: bottom },
+    { x: left, y: bottom }
+  ];
+}
+function defaultPointsForImage(img) {
+  // similar but in image pixel coordinates
+  const w = img.width, h = img.height;
+  const mf = 0.2;
+  return [
+    { x: w*mf, y: h*mf },
+    { x: w*(1-mf), y: h*mf },
+    { x: w*(1-mf), y: h*(1-mf) },
+    { x: w*mf, y: h*(1-mf) }
+  ];
+}
+
+/////////////////////////
+// Overlay drawing & dragging
+overlayCanvas.addEventListener('pointerdown', (ev) => {
+  ev.preventDefault();
+  const rect = overlayCanvas.getBoundingClientRect();
+  const x = (ev.clientX - rect.left) * (overlayCanvas.width / rect.width);
+  const y = (ev.clientY - rect.top) * (overlayCanvas.height / rect.height);
+  // find nearest outer handle within outerHandleRadius * devicePixelRatio
+  let nearest = -1;
+  let nearestDist = Infinity;
+  for (let i=0;i<outerHandles.length;i++) {
+    const dx = outerHandles[i].x*devicePixelRatio_ - x;
+    const dy = outerHandles[i].y*devicePixelRatio_ - y;
+    const d = Math.hypot(dx,dy);
+    if (d < nearestDist) { nearestDist = d; nearest = i; }
+  }
+  if (nearest !== -1 && nearestDist <= outerHandleRadius * devicePixelRatio_) {
+    draggingIndex = nearest;
+    overlayCanvas.setPointerCapture(ev.pointerId);
+  }
+});
+overlayCanvas.addEventListener('pointermove', (ev) => {
+  if (draggingIndex === -1) return;
+  ev.preventDefault();
+  const rect = overlayCanvas.getBoundingClientRect();
+  const x = (ev.clientX - rect.left) * (overlayCanvas.width / rect.width) / devicePixelRatio_;
+  const y = (ev.clientY - rect.top) * (overlayCanvas.height / rect.height) / devicePixelRatio_;
+  // clamp to canvas
+  const cw = origCanvas.width / devicePixelRatio_;
+  const ch = origCanvas.height / devicePixelRatio_;
+  currentPoints[draggingIndex].x = Math.max(0, Math.min(cw, x));
+  currentPoints[draggingIndex].y = Math.max(0, Math.min(ch, y));
+  outerHandles[draggingIndex].x = currentPoints[draggingIndex].x;
+  outerHandles[draggingIndex].y = currentPoints[draggingIndex].y;
+  redrawOverlay();
+  computeAndDrawRectified();
+});
+overlayCanvas.addEventListener('pointerup', (ev) => {
+  if (draggingIndex !== -1) {
+    try { overlayCanvas.releasePointerCapture(ev.pointerId); } catch(e){}
+    draggingIndex = -1;
+  }
+});
+
+function redrawOverlay() {
+  // draw crosshairs, lines on overlay canvas
+  overlayCtx.setTransform(1,0,0,1,0,0);
+  overlayCtx.clearRect(0,0,overlayCanvas.width, overlayCanvas.height);
+  overlayCtx.save();
+  overlayCtx.scale(devicePixelRatio_, devicePixelRatio_);
+
+  // draw translucent shading outside polygon
+  overlayCtx.fillStyle = 'rgba(0,0,0,0.25)';
+  overlayCtx.beginPath();
+  overlayCtx.moveTo(0,0);
+  // draw polygon path scaled to canvas size
+  const points = currentPoints;
+  overlayCtx.lineTo(points[0].x, points[0].y);
+  overlayCtx.lineTo(points[1].x, points[1].y);
+  overlayCtx.lineTo(points[2].x, points[2].y);
+  overlayCtx.lineTo(points[3].x, points[3].y);
+  overlayCtx.closePath();
+  // fill full canvas then use 'even-odd' to carve out polygon
+  overlayCtx.fillRect(0,0,overlayCanvas.width/devicePixelRatio_, overlayCanvas.height/devicePixelRatio_);
+  // draw polygon outline
+  overlayCtx.globalCompositeOperation = 'source-over';
+  overlayCtx.strokeStyle = '#00ff88';
+  overlayCtx.lineWidth = 2;
+  overlayCtx.beginPath();
+  overlayCtx.moveTo(points[0].x, points[0].y);
+  for (let i=1;i<points.length;i++) overlayCtx.lineTo(points[i].x, points[i].y);
+  overlayCtx.closePath();
+  overlayCtx.stroke();
+
+  // draw crosshairs at each point (user asked for crosshairs instead of circles)
+  overlayCtx.strokeStyle = '#ff3333';
+  overlayCtx.lineWidth = 2;
+  for (let i=0;i<points.length;i++) {
+    const p = points[i];
+    drawCrosshair(overlayCtx, p.x, p.y, crosshairSize);
+    // draw larger translucent hit area outline for debugging (comment out if not wanted)
+    //overlayCtx.strokeStyle='rgba(255,255,255,0.12)'; overlayCtx.beginPath(); overlayCtx.arc(p.x,p.y,outerHandleRadius,0,Math.PI*2); overlayCtx.stroke();
+    overlayCtx.strokeStyle = '#ff3333';
+  }
+
+  overlayCtx.restore();
+}
+
+function drawCrosshair(ctx, cx, cy, s) {
+  const l = s;
+  ctx.beginPath();
+  ctx.moveTo(cx - l, cy);
+  ctx.lineTo(cx + l, cy);
+  ctx.moveTo(cx, cy - l);
+  ctx.lineTo(cx, cy + l);
+  ctx.stroke();
+}
+
+/////////////////////////
+// Homography & rectification
+// We will compute homography H that maps the quad (currentPoints in image pixels) to a rectangle
+// Destination rectangle: axis-aligned bounding box of the quad, expanded by border%
+// We'll compute inverse mapping and sample using bilinear interpolation into output canvas
+
+function computeAndDrawRectified() {
+  if (!currentImage || currentPoints.length!==4) return;
+  // currentPoints are in canvas display coordinates scaled to origCanvas width/height.
+  // We must map them to the original image pixel coordinates for accurate warping.
+  const displayW = origCanvas.width / devicePixelRatio_;
+  const displayH = origCanvas.height / devicePixelRatio_;
+  const imgW = currentImage.width;
+  const imgH = currentImage.height;
+  // mapping factor
+  const sx = imgW / displayW;
+  const sy = imgH / displayH;
+  const src = currentPoints.map(p => ({ x: p.x * sx, y: p.y * sy }));
+
+  // compute bounding rect of the source quad
+  let minx = Math.min(...src.map(p=>p.x));
+  let maxx = Math.max(...src.map(p=>p.x));
+  let miny = Math.min(...src.map(p=>p.y));
+  let maxy = Math.max(...src.map(p=>p.y));
+  // border percentage
+  const borderPct = parseFloat(borderRange.value)/100;
+  const bw = (maxx - minx) * borderPct;
+  const bh = (maxy - miny) * borderPct;
+  minx = Math.max(0, minx - bw);
+  miny = Math.max(0, miny - bh);
+  maxx = Math.min(imgW, maxx + bw);
+  maxy = Math.min(imgH, maxy + bh);
+
+  const destW = Math.max(1, Math.round(maxx - minx));
+  const destH = Math.max(1, Math.round(maxy - miny));
+
+  // destination rectangle corners (top-left, top-right, bottom-right, bottom-left) in image pixel coords
+  const dst = [
+    { x: 0,       y: 0 },
+    { x: destW-1, y: 0 },
+    { x: destW-1, y: destH-1 },
+    { x: 0,       y: destH-1 }
+  ];
+
+  // Now compute homography H mapping src -> dst (3x3)
+  const H = solveHomography(src, dst); // returns 3x3 matrix array
+  if (!H) {
+    showMsg('Failed to compute homography.');
+    return;
+  }
+  // We need inverse mapping from dest -> src. Compute inverse of H.
+  const Hinv = invert3x3(H);
+  if (!Hinv) {
+    showMsg('Failed to invert homography.');
+    return;
+  }
+
+  // Create a temp canvas with destW/destH and use pixel-level inverse mapping sampling
+  rectCanvas.width = Math.round(destW * devicePixelRatio_);
+  rectCanvas.height = Math.round(destH * devicePixelRatio_);
+  rectCanvas.style.width = destW + 'px';
+  rectCanvas.style.height = destH + 'px';
+  rectCtx.setTransform(devicePixelRatio_,0,0,devicePixelRatio_,0,0);
+  rectCtx.clearRect(0,0,destW,destH);
+
+  // draw image data into an offscreen canvas at full image size so we can sample from it
+  const off = document.createElement('canvas');
+  off.width = currentImage.width;
+  off.height = currentImage.height;
+  const offCtx = off.getContext('2d');
+  offCtx.drawImage(currentImage, 0, 0, off.width, off.height);
+  const srcImgData = offCtx.getImageData(0,0,off.width, off.height);
+  const srcData = srcImgData.data;
+  const sw = off.width, sh = off.height;
+
+  const outImg = rectCtx.createImageData(destW, destH);
+  const outData = outImg.data;
+
+  // inverse mapping per dest pixel
+  for (let y=0;y<destH;y++) {
+    for (let x=0;x<destW;x++) {
+      // map (x,y,1) through Hinv to src
+      const denom = Hinv[6]*x + Hinv[7]*y + Hinv[8];
+      if (denom === 0) continue;
+      const sxReal = (Hinv[0]*x + Hinv[1]*y + Hinv[2]) / denom;
+      const syReal = (Hinv[3]*x + Hinv[4]*y + Hinv[5]) / denom;
+      // sample with bilinear interpolation from srcData
+      const c = bilinearSample(srcData, sw, sh, sxReal + minx, syReal + miny); // note: src coords are offset by minx/miny
+      const idx = (y*destW + x) * 4;
+      outData[idx]   = c[0];
+      outData[idx+1] = c[1];
+      outData[idx+2] = c[2];
+      outData[idx+3] = c[3];
+    }
+  }
+  rectCtx.putImageData(outImg, 0, 0);
+
+  // update meta
+  updateMetaInfo();
+}
+
+// Bilinear sample from image data with clamping
+function bilinearSample(data, w, h, xf, yf) {
+  // xf,yf are in image coordinates
+  if (xf < 0 || yf < 0 || xf >= w-1 || yf >= h-1) {
+    // clamp to nearest pixel
+    const xi = Math.max(0, Math.min(w-1, Math.round(xf)));
+    const yi = Math.max(0, Math.min(h-1, Math.round(yf)));
+    const idx = (yi*w + xi)*4;
+    return [ data[idx], data[idx+1], data[idx+2], data[idx+3] ];
+  }
+  const x0 = Math.floor(xf), y0 = Math.floor(yf);
+  const x1 = x0 + 1, y1 = y0 + 1;
+  const dx = xf - x0, dy = yf - y0;
+  const idx00 = (y0*w + x0)*4, idx10 = (y0*w + x1)*4, idx01 = (y1*w + x0)*4, idx11 = (y1*w + x1)*4;
+  const out = [0,0,0,0];
+  for (let k=0;k<4;k++) {
+    const v00 = data[idx00 + k], v10 = data[idx10 + k], v01 = data[idx01 + k], v11 = data[idx11 + k];
+    const v0 = v00*(1-dx) + v10*dx;
+    const v1 = v01*(1-dx) + v11*dx;
+    out[k] = v0*(1-dy) + v1*dy;
+  }
+  return out;
+}
+
+// Solve homography H such that for i=0..3, H * [src[i].x,src[i].y,1] ~ [dst[i].x,dst[i].y,1]
+// returns array of 9 numbers row-major
+function solveHomography(src, dst) {
+  // build 8x8 system A * h = b (h is 8 unknowns; last h_8 = 1)
+  const A = [], b = [];
+  for (let i=0;i<4;i++) {
+    const xs = src[i].x, ys = src[i].y;
+    const xd = dst[i].x, yd = dst[i].y;
+    A.push([ xs, ys, 1, 0, 0, 0, -xs*xd, -ys*xd ]);
+    b.push(xd);
+    A.push([ 0, 0, 0, xs, ys, 1, -xs*yd, -ys*yd ]);
+    b.push(yd);
+  }
+  // Solve via Gaussian elimination for 8 unknowns
+  const sol = solveLinearSystem(A, b);
+  if (!sol) return null;
+  const h = sol.concat([1]); // 9 elements
+  return h;
+}
+
+// simple linear solver for Ax=b where A is n x n
+function solveLinearSystem(A, b) {
+  const n = A.length;
+  // form augmented matrix
+  const M = [];
+  for (let i=0;i<n;i++) {
+    M[i] = A[i].slice();
+    M[i].push(b[i]);
+  }
+  // Gaussian elimination
+  for (let i=0;i<n;i++) {
+    // pivot
+    let maxRow = i;
+    for (let k=i+1;k<n;k++) {
+      if (Math.abs(M[k][i]) > Math.abs(M[maxRow][i])) maxRow = k;
+    }
+    if (Math.abs(M[maxRow][i]) < 1e-12) return null; // singular
+    // swap
+    [M[i], M[maxRow]] = [M[maxRow], M[i]];
+    // normalize
+    const piv = M[i][i];
+    for (let j=i;j<=n;j++) M[i][j] /= piv;
+    // eliminate
+    for (let k=0;k<n;k++) {
+      if (k===i) continue;
+      const f = M[k][i];
+      for (let j=i;j<=n;j++) M[k][j] -= f*M[i][j];
+    }
+  }
+  // extract solution
+  const x = new Array(n);
+  for (let i=0;i<n;i++) x[i] = M[i][n];
+  return x;
+}
+
+// invert 3x3 matrix
+function invert3x3(m) {
+  // m is array length 9 row-major
+  const a = m[0], b=m[1], c=m[2],
+        d = m[3], e=m[4], f=m[5],
+        g=m[6], h=m[7], i=m[8];
+  const A = e*i - f*h;
+  const B = -(d*i - f*g);
+  const C = d*h - e*g;
+  const D = -(b*i - c*h);
+  const E = a*i - c*g;
+  const F = -(a*h - b*g);
+  const G = b*f - c*e;
+  const H = -(a*f - c*d);
+  const I = a*e - b*d;
+  const det = a*A + b*B + c*C;
+  if (Math.abs(det) < 1e-12) return null;
+  const invDet = 1/det;
+  const out = [A*invDet, D*invDet, G*invDet,
+               B*invDet, E*invDet, H*invDet,
+               C*invDet, F*invDet, I*invDet];
+  return out;
+}
+
+/////////////////////////
+// EXIF GPS extraction (lightweight)
+// We'll parse minimal EXIF GPS tags to get latitude/longitude if present.
+// This function reads the ArrayBuffer and scans for EXIF. It is minimal and works for most JPEGs.
+
+async function extractGPSFromBlobEXIF(blob) {
+  const buf = await blob.arrayBuffer();
+  const data = new DataView(buf);
+  // check JPEG SOI
+  if (data.getUint16(0) !== 0xFFD8) return null;
+  let offset = 2;
+  const len = data.byteLength;
+  while (offset < len) {
+    const marker = data.getUint16(offset);
+    offset += 2;
+    const size = data.getUint16(offset); offset += 2;
+    if (marker === 0xFFE1) { // APP1 - EXIF
+      // check "Exif\0\0"
+      let exifHeader = '';
+      for (let i=0;i<6;i++) exifHeader += String.fromCharCode(data.getUint8(offset + i));
+      if (exifHeader !== 'Exif\0\0') break;
+      const tiffOffset = offset + 6;
+      // determine endianness
+      const endian = (data.getUint16(tiffOffset) === 0x4949) ? 'LE' : 'BE';
+      const dv = data;
+      const get16 = (off) => endian==='LE' ? dv.getUint16(off, true) : dv.getUint16(off, false);
+      const get32 = (off) => endian==='LE' ? dv.getUint32(off, true) : dv.getUint32(off, false);
+      const firstIfdOffset = get32(tiffOffset + 4);
+      const ifd0 = tiffOffset + firstIfdOffset;
+      const numEntries = get16(ifd0);
+      // scan entries for GPS IFD pointer (tag 0x8825)
+      let gpsOffset = 0;
+      for (let i=0;i<numEntries;i++) {
+        const entryOff = ifd0 + 2 + i*12;
+        const tag = get16(entryOff);
+        const val = get32(entryOff+8);
+        if (tag === 0x8825) {
+          gpsOffset = tiffOffset + val;
+          break;
+        }
+      }
+      if (!gpsOffset) return null;
+      const gpsEntries = get16(gpsOffset);
+      // read necessary tags: GPSLatitudeRef(1), GPSLatitude(2), GPSLongitudeRef(3), GPSLongitude(4)
+      let latRef=null, lat=null, lonRef=null, lon=null;
+      for (let i=0;i<gpsEntries;i++) {
+        const eOff = gpsOffset + 2 + i*12;
+        const tag = get16(eOff);
+        const format = get16(eOff+2);
+        const components = get32(eOff+4);
+        const valOff = get32(eOff+8);
+        const dataOff = tiffOffset + valOff;
+        if (tag === 1) { // lat ref (ASCII)
+          latRef = String.fromCharCode(dv.getUint8(dataOff));
+        } else if (tag === 2) { // lat (3 rationals)
+          // format 5 = rational
+          if (format === 5 && components>=3) {
+            const deg = dv.getUint32(dataOff, endian==='LE') / dv.getUint32(dataOff+4, endian==='LE');
+            const min = dv.getUint32(dataOff+8, endian==='LE') / dv.getUint32(dataOff+12, endian==='LE');
+            const sec = dv.getUint32(dataOff+16, endian==='LE') / dv.getUint32(dataOff+20, endian==='LE');
+            lat = deg + min/60 + sec/3600;
+          }
+        } else if (tag === 3) {
+          lonRef = String.fromCharCode(dv.getUint8(dataOff));
+        } else if (tag === 4) {
+          if (format === 5 && components>=3) {
+            const deg = dv.getUint32(dataOff, endian==='LE') / dv.getUint32(dataOff+4, endian==='LE');
+            const min = dv.getUint32(dataOff+8, endian==='LE') / dv.getUint32(dataOff+12, endian==='LE');
+            const sec = dv.getUint32(dataOff+16, endian==='LE') / dv.getUint32(dataOff+20, endian==='LE');
+            lon = deg + min/60 + sec/3600;
+          }
+        }
+      }
+      if (lat !== null && lon !== null) {
+        if (latRef === 'S') lat = -lat;
+        if (lonRef === 'W') lon = -lon;
+        return { latitude: lat, longitude: lon };
+      }
+      return null;
+    } else {
+      offset += size - 2;
+    }
+  }
+  return null;
+}
+
+/////////////////////////
+// Helpers: rectifiedCanvasFromImageAndPoints used for ZIP export
+async function rectifiedCanvasFromImageAndPoints(img, ptsInImageCoords, borderPct) {
+  // similar to computeAndDrawRectified but returns an offscreen canvas
+  // compute bounding rectangle expanded by borderPct
+  let minx = Math.min(...ptsInImageCoords.map(p=>p.x));
+  let maxx = Math.max(...ptsInImageCoords.map(p=>p.x));
+  let miny = Math.min(...ptsInImageCoords.map(p=>p.y));
+  let maxy = Math.max(...ptsInImageCoords.map(p=>p.y));
+  const bw = (maxx - minx) * borderPct;
+  const bh = (maxy - miny) * borderPct;
+  minx = Math.max(0, minx - bw);
+  miny = Math.max(0, miny - bh);
+  maxx = Math.min(img.width, maxx + bw);
+  maxy = Math.min(img.height, maxy + bh);
+  const destW = Math.max(1, Math.round(maxx - minx));
+  const destH = Math.max(1, Math.round(maxy - miny));
+  const dst = [
+    { x: 0,       y: 0 },
+    { x: destW-1, y: 0 },
+    { x: destW-1, y: destH-1 },
+    { x: 0,       y: destH-1 }
+  ];
+  const H = solveHomography(ptsInImageCoords, dst);
+  const Hinv = invert3x3(H);
+  const off = document.createElement('canvas');
+  off.width = img.width;
+  off.height = img.height;
+  const offCtx = off.getContext('2d');
+  offCtx.drawImage(img, 0, 0);
+  const srcImgData = offCtx.getImageData(0,0,off.width, off.height);
+  const srcData = srcImgData.data;
+  const sw = off.width, sh = off.height;
+  const outCanvas = document.createElement('canvas');
+  outCanvas.width = destW;
+  outCanvas.height = destH;
+  const outCtx = outCanvas.getContext('2d');
+  const outImg = outCtx.createImageData(destW, destH);
+  const outData = outImg.data;
+  for (let y=0;y<destH;y++) {
+    for (let x=0;x<destW;x++) {
+      const denom = Hinv[6]*x + Hinv[7]*y + Hinv[8];
+      if (denom === 0) continue;
+      const sxReal = (Hinv[0]*x + Hinv[1]*y + Hinv[2]) / denom;
+      const syReal = (Hinv[3]*x + Hinv[4]*y + Hinv[5]) / denom;
+      const c = bilinearSample(srcData, sw, sh, sxReal + minx, syReal + miny);
+      const idx = (y*destW + x) * 4;
+      outData[idx]   = c[0];
+      outData[idx+1] = c[1];
+      outData[idx+2] = c[2];
+      outData[idx+3] = c[3];
+    }
+  }
+  outCtx.putImageData(outImg, 0, 0);
+  return { canvas: outCanvas };
+}
+
+/////////////////////////
+// Utility: convert current image and points to rectified blob for saving (already used above)
+async function rectifiedCanvasBlobFromCurrent() {
+  if (!currentImage || currentPoints.length!==4) return null;
+  // reuse computeAndDrawRectified logic but return blob
+  computeAndDrawRectified();
+  return new Promise(r => rectCanvas.toBlob(r, 'image/jpeg', 0.92));
+}
+
+/////////////////////////
+// Small initialization
+updateStoredCount();
+showMsg('Ready. Press "Enable Camera" to start.');
+
+/* Notes & Tips for behavior on iPhone:
+ - To capture from the camera directly, use the "Enable Camera" button which triggers file input with capture="environment".
+ - On iOS Safari, navigator.share with files will present the native share sheet; choose "Save Image" to save to Photos.
+ - If you used the "download" fallback, Safari places the file in Files > Downloads; from Files, long-press image -> Share -> Save Image.
+ - Safari will not let a website silently put images in Photos without user interaction.
+*/
+
+</script>
+</body>
+</html>
