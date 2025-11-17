@@ -1,0 +1,287 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Image Rectifier</title>
+<style>
+  body { font-family: sans-serif; margin: 10px; }
+  canvas { width: 100%; margin-top: 8px; border: 1px solid #aaa; display:block;}
+  #container { position: relative; width: 100%; }
+  .handle {
+    position: absolute;
+    z-index: 10; /* ensures above canvas */
+    width: 28px; height: 28px;
+    background: rgba(255,255,255,0.9);
+    border: 3px solid #000;
+    border-radius: 3px;
+    touch-action: none;
+  }
+  #shareBtn { padding: 12px; font-size: 18px; width: 100%; margin-top:10px;}
+</style>
+</head>
+<body>
+
+<h3>Image Rectifier</h3>
+
+<input type="file" id="camera" accept="image/*" capture="environment">
+
+<div id="gpsInfo"></div>
+
+<div id="container">
+  <canvas id="original"></canvas>
+</div>
+
+<h4>Rectified Result</h4>
+<canvas id="rectified"></canvas>
+
+<button id="shareBtn">Share Rectified Image</button>
+
+<script>
+/* ============================================================
+   IndexedDB Setup
+============================================================ */
+let db;
+const req = indexedDB.open("rectifierDB", 1);
+req.onupgradeneeded = e => {
+  db = e.target.result;
+  db.createObjectStore("images", { keyPath: "id", autoIncrement: true });
+};
+req.onsuccess = e => { db = e.target.result; };
+
+/* ============================================================
+   GPS Collection
+============================================================ */
+navigator.geolocation.getCurrentPosition(pos => {
+  const { latitude, longitude } = pos.coords;
+  document.getElementById("gpsInfo").textContent =
+    `GPS: ${latitude.toFixed(5)}, ${longitude.toFixed(5)}`;
+});
+
+/* ============================================================
+   Canvas + control point logic
+============================================================ */
+const fileInput = document.getElementById("camera");
+const origCanvas = document.getElementById("original");
+const origCtx = origCanvas.getContext("2d");
+const rectCanvas = document.getElementById("rectified");
+const rectCtx = rectCanvas.getContext("2d");
+const container = document.getElementById("container");
+
+let image = new Image();
+let handles = [];
+let points = [];
+
+fileInput.onchange = e => {
+  const f = e.target.files[0];
+  if (!f) return;
+  const url = URL.createObjectURL(f);
+  image.onload = () => { setupImage(); URL.revokeObjectURL(url); };
+  image.src = url;
+};
+
+/* ============================================================
+   Setup image + initial crosshair positions
+============================================================ */
+function setupImage() {
+  const w = image.width;
+  const h = image.height;
+  origCanvas.width = w;
+  origCanvas.height = h;
+  container.style.width = w + "px";
+  container.style.height = h + "px";
+  origCtx.drawImage(image, 0, 0);
+
+  points = [
+    { x: w*0.5 - w*0.2, y: h*0.5 - h*0.2 },
+    { x: w*0.5 + w*0.2, y: h*0.5 - h*0.2 },
+    { x: w*0.5 + w*0.2, y: h*0.5 + h*0.2 },
+    { x: w*0.5 - w*0.2, y: h*0.5 + h*0.2 }
+  ];
+
+  clearHandles();
+  createHandles();
+  redraw();
+}
+
+/* ============================================================
+   Handles
+============================================================ */
+function clearHandles() {
+  handles.forEach(h => h.remove());
+  handles = [];
+}
+
+function createHandles() {
+  const offset = 60;
+  points.forEach((p,i)=>{
+    const h = document.createElement("div");
+    h.className = "handle";
+
+    const maxX = origCanvas.width - 28;
+    const maxY = origCanvas.height - 28;
+    h.style.left = Math.min(Math.max(p.x + offset,0), maxX) + "px";
+    h.style.top  = Math.min(Math.max(p.y + offset,0), maxY) + "px";
+
+    h.dataset.index = i;
+    container.appendChild(h);
+    handles.push(h);
+    dragHandle(h,i,offset);
+  });
+}
+
+function dragHandle(handle,index,offset){
+  let dragging=false;
+  handle.addEventListener("pointerdown",e=>{dragging=true; handle.setPointerCapture(e.pointerId);});
+  handle.addEventListener("pointermove",e=>{
+    if(!dragging) return;
+    const imgW = origCanvas.width;
+    const imgH = origCanvas.height;
+    let lx = e.clientX - container.offsetLeft - 14;
+    let ly = e.clientY - container.offsetTop - 14;
+    lx = Math.max(0,Math.min(imgW-28,lx));
+    ly = Math.max(0,Math.min(imgH-28,ly));
+    handle.style.left = lx + "px";
+    handle.style.top = ly + "px";
+
+    points[index].x = lx - offset;
+    points[index].y = ly - offset;
+    points[index].x = Math.max(0,Math.min(imgW,points[index].x));
+    points[index].y = Math.max(0,Math.min(imgH,points[index].y));
+    redraw();
+  });
+  handle.addEventListener("pointerup",e=>{dragging=false; handle.releasePointerCapture(e.pointerId);});
+}
+
+/* ============================================================
+   Redraw image + crosshairs + green lines
+============================================================ */
+function redraw(){
+  origCtx.drawImage(image,0,0);
+  origCtx.strokeStyle="#00FF00";
+  origCtx.lineWidth=6;
+  origCtx.beginPath();
+  origCtx.moveTo(points[0].x,points[0].y);
+  for(let i=1;i<points.length;i++) origCtx.lineTo(points[i].x,points[i].y);
+  origCtx.closePath(); origCtx.stroke();
+
+  origCtx.strokeStyle="#FF0000";
+  origCtx.lineWidth=4;
+  points.forEach(p=>{
+    origCtx.beginPath();
+    origCtx.moveTo(p.x-30,p.y); origCtx.lineTo(p.x+30,p.y);
+    origCtx.moveTo(p.x,p.y-30); origCtx.lineTo(p.x,p.y+30);
+    origCtx.stroke();
+  });
+
+  makeRectified();
+}
+
+/* ============================================================
+   Homography + rectification
+============================================================ */
+function makeRectified(){
+  const src=points, w=image.width,h=image.height;
+  const border=0.10, bw=w*border,bh=h*border;
+  const dst=[{x:bw,y:bh},{x:w-bw,y:bh},{x:w-bw,y:h-bh},{x:bw,y:h-bh}];
+  rectCanvas.width=w; rectCanvas.height=h;
+  const H=computeHomography(src,dst);
+  warpImage(image,rectCtx,H,w,h);
+}
+
+function computeHomography(src,dst){
+  const A=[];
+  for(let i=0;i<4;i++){
+    const x=src[i].x,y=src[i].y,u=dst[i].x,v=dst[i].y;
+    A.push([x,y,1,0,0,0,-u*x,-u*y,-u]);
+    A.push([0,0,0,x,y,1,-v*x,-v*y,-v]);
+  }
+  return solveHomog(A);
+}
+
+function solveHomog(A){
+  const m=math.lusolve(math.matrix(A.slice(0,8).map(r=>r.slice(0,8))),
+                       math.matrix(A.slice(0,8).map(r=>r[8])));
+  return [...m.toArray(),1];
+}
+
+/* ============================================================
+   Bilinear warp
+============================================================ */
+function warpImage(img,ctx,H,W,Ht){
+  const output=ctx.createImageData(W,Ht);
+  const dst=output.data;
+  const tmp=document.createElement("canvas");
+  tmp.width=img.width; tmp.height=img.height;
+  const tctx=tmp.getContext("2d"); tctx.drawImage(img,0,0);
+  const src=tctx.getImageData(0,0,img.width,img.height).data;
+
+  function transform(x,y){
+    const nx=H[0]*x+H[1]*y+H[2];
+    const ny=H[3]*x+H[4]*y+H[5];
+    const nz=H[6]*x+H[7]*y+1;
+    return [nx/nz,ny/nz];
+  }
+
+  for(let y=0;y<Ht;y++){
+    for(let x=0;x<W;x++){
+      const di=(y*W+x)*4;
+      const [sx,sy]=transform(x,y);
+      if(sx<0||sy<0||sx>=img.width-1||sy>=img.height-1){dst[di+3]=255; continue;}
+      const x0=Math.floor(sx), y0=Math.floor(sy), dx=sx-x0, dy=sy-y0;
+      function sample(ix,iy){const i=(iy*img.width+ix)*4; return [src[i],src[i+1],src[i+2]];}
+      const c00=sample(x0,y0), c10=sample(x0+1,y0), c01=sample(x0,y0+1), c11=sample(x0+1,y0+1);
+      dst[di]   = c00[0]*(1-dx)*(1-dy)+c10[0]*dx*(1-dy)+c01[0]*(1-dx)*dy+c11[0]*dx*dy;
+      dst[di+1] = c00[1]*(1-dx)*(1-dy)+c10[1]*dx*(1-dy)+c01[1]*(1-dx)*dy+c11[1]*dx*dy;
+      dst[di+2] = c00[2]*(1-dx)*(1-dy)+c10[2]*dx*(1-dy)+c01[2]*(1-dx)*dy+c11[2]*dx*dy;
+      dst[di+3]=255;
+    }
+  }
+  ctx.putImageData(output,0,0);
+}
+
+/* ============================================================
+   Share rectified image → delete original
+============================================================ */
+document.getElementById("shareBtn").onclick=async()=>{
+  rectCanvas.toBlob(async blob=>{
+    if(navigator.canShare && navigator.canShare({files:[new File([blob],"rectified.jpg")]})){
+      await navigator.share({files:[new File([blob],"rectified.jpg")],title:"Rectified Image"});
+      const tx=db.transaction("images","readwrite");
+      tx.objectStore("images").add({data:blob});
+      image=null;
+      origCtx.clearRect(0,0,origCanvas.width,origCanvas.height);
+      alert("Original image deleted after share.");
+    }else{alert("Sharing not supported.");}
+  },"image/jpeg",0.95);
+};
+
+/* ============================================================
+   Minimal math library for homography solver
+============================================================ */
+window.math={
+  lusolve(A,b){
+    A=A.toArray?A.toArray():A; b=b.toArray?b.toArray():b;
+    const n=A.length;
+    for(let i=0;i<n;i++){
+      let max=i;
+      for(let k=i+1;k<n;k++) if(Math.abs(A[k][i])>Math.abs(A[max][i])) max=k;
+      [A[i],A[max]]=[A[max],A[i]]; [b[i],b[max]]=[b[max],b[i]];
+      for(let k=i+1;k<n;k++){
+        const c=A[k][i]/A[i][i];
+        for(let j=i;j<n;j++) A[k][j]-=c*A[i][j];
+        b[k]-=c*b[i];
+      }
+    }
+    const x=new Array(n).fill(0);
+    for(let i=n-1;i>=0;i--){
+      let s=b[i];
+      for(let j=i+1;j<n;j++) s-=A[i][j]*x[j];
+      x[i]=s/A[i][i];
+    }
+    return x;
+  },
+  matrix(a){return {toArray:()=>a};}
+};
+</script>
+</body>
+</html>
