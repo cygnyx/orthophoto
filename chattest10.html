@@ -1,0 +1,708 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1.0,viewport-fit=cover" />
+<title>Photo Rectifier (IndexedDB, Camera, GPS)</title>
+<style>
+  body { font-family: -apple-system, system-ui, Roboto, "Helvetica Neue", Arial; margin: 0; padding: 0; background: #f6f7fb; color: #111; }
+  header { padding: 12px; display:flex; gap:8px; align-items:center; background: #fff; border-bottom:1px solid #e6e7eb; }
+  header h1 { font-size:16px; margin:0; flex:1; }
+  main { padding: 12px; display:flex; gap:12px; flex-direction:column; max-width:1100px; margin:0 auto; }
+  .controls { display:flex; gap:8px; flex-wrap:wrap; }
+  button, input[type=range] { font-size:14px; padding:8px 10px; border-radius:8px; border:1px solid #ccc; background:#fff; }
+  .grid { display:flex; gap:12px; align-items:flex-start; justify-content:flex-start; flex-wrap:wrap; }
+  .viewer { background:#222; min-width:320px; min-height:240px; position:relative; overflow:visible; border-radius:8px; }
+  canvas#sourceCanvas { display:block; max-width:100%; height:auto; background: #000; }
+  .overlay { position:absolute; left:0; top:0; right:0; bottom:0; pointer-events: none; }
+  .point { position:absolute; width:18px; height:18px; border-radius:50%; margin:-9px 0 0 -9px; border:3px solid white; box-shadow:0 1px 3px rgba(0,0,0,0.4); pointer-events:auto; touch-action:none; }
+  .point.handle { background: #ffcc00; border-color:#333; }
+  svg.lines { position:absolute; left:0; top:0; width:100%; height:100%; pointer-events:none; }
+  .thumbs { display:flex; gap:8px; flex-wrap:wrap; align-items:center; max-width:560px; }
+  .thumb { width:64px; height:64px; object-fit:cover; border-radius:6px; border:1px solid #ddd; cursor:pointer; }
+  .meta { font-size:12px; color:#555; margin-top:8px; }
+  label { font-size:13px; }
+  .rightcol { min-width:320px; }
+  .preview { border-radius:8px; background:#fff; padding:8px; border:1px solid #e6e7eb; max-width:420px; }
+  .btn-danger { background:#ff4d4f; color:white; border-color:#e53935; }
+  footer { padding:12px; font-size:12px; color:#666; text-align:center; }
+  small.helper { color:#666; display:block; margin-top:6px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Photo Rectifier — Camera → IndexedDB → Export</h1>
+  <div class="controls">
+    <button id="enableCameraBtn">Enable Camera</button>
+    <button id="openCameraBtn">Take Photo</button>
+    <button id="exportBtn" disabled>Export Rectified → Photos (download)</button>
+  </div>
+</header>
+
+<main>
+  <div class="controls">
+    <label>Border: <span id="borderLabel">5</span>%</label>
+    <input id="borderRange" type="range" min="0" max="30" value="5" />
+    <label>Point color</label>
+    <input id="pointColor" type="color" value="#ffcc00" />
+  </div>
+
+  <div class="grid">
+    <div class="viewer" id="viewer">
+      <canvas id="sourceCanvas"></canvas>
+
+      <!-- overlay for svg lines -->
+      <svg class="lines" id="linesSvg" xmlns="http://www.w3.org/2000/svg"></svg>
+
+      <!-- points (draggable) -->
+      <div id="p0" class="point handle" style="left:10%; top:10%;"></div>
+      <div id="p1" class="point handle" style="left:90%; top:10%;"></div>
+      <div id="p2" class="point handle" style="left:90%; top:90%;"></div>
+      <div id="p3" class="point handle" style="left:10%; top:90%;"></div>
+
+    </div>
+
+    <div class="rightcol">
+      <div class="preview">
+        <h3 style="margin:0 0 8px 0;font-size:15px;">Rectified Preview</h3>
+        <canvas id="previewCanvas" width="400" height="300" style="width:100%;height:auto;border-radius:6px;background:#eee;"></canvas>
+        <div class="meta" id="meta"></div>
+      </div>
+
+      <div style="margin-top:12px;">
+        <h4 style="margin:6px 0;">Staged photos</h4>
+        <div class="thumbs" id="thumbs"></div>
+        <small class="helper">Tap a thumbnail to edit. Photo GPS (if allowed) shown below.</small>
+      </div>
+
+      <div style="margin-top:12px;">
+        <button id="deleteBtn" class="btn-danger" disabled>Delete Selected Staged Photo</button>
+      </div>
+    </div>
+  </div>
+
+  <input id="cameraInput" type="file" accept="image/*" capture="environment" style="display:none" />
+</main>
+<footer>
+  Notes: After export, Safari will offer Save Image. This app deletes the staged original from IndexedDB after export (as requested).
+</footer>
+
+<script>
+/*
+  Photo Rectifier Webapp
+  - IndexedDB for staging photos
+  - Camera capture input
+  - Draggable 4 corner points overlay
+  - Rectification via two-triangle affine mapping (approximation of perspective)
+  - Border percent cropping
+  - GPS via navigator.geolocation at capture time
+  - Export triggers download blob; then delete original from DB
+*/
+
+(() => {
+  // ------------ IndexedDB helpers ------------
+  const DB_NAME = 'PhotoRectifierDB';
+  const STORE_NAME = 'photos';
+  let db = null;
+
+  function openDb() {
+    return new Promise((resolve, reject) => {
+      const req = indexedDB.open(DB_NAME, 1);
+      req.onupgradeneeded = (ev) => {
+        const idb = ev.target.result;
+        if (!idb.objectStoreNames.contains(STORE_NAME)) {
+          const s = idb.createObjectStore(STORE_NAME, { keyPath: 'id', autoIncrement: true });
+          s.createIndex('timestamp', 'timestamp', { unique: false });
+        }
+      };
+      req.onsuccess = () => { db = req.result; resolve(db); };
+      req.onerror = () => reject(req.error);
+    });
+  }
+
+  function addPhoto(blob, meta) {
+    return new Promise((resolve, reject) => {
+      const tx = db.transaction(STORE_NAME, 'readwrite');
+      const store = tx.objectStore(STORE_NAME);
+      const record = { blob, meta: meta || {}, timestamp: Date.now() };
+      const r = store.add(record);
+      r.onsuccess = () => resolve(r.result);
+      r.onerror = () => reject(r.error);
+    });
+  }
+
+  function getAllPhotos() {
+    return new Promise((resolve, reject) => {
+      const tx = db.transaction(STORE_NAME, 'readonly');
+      const store = tx.objectStore(STORE_NAME);
+      const req = store.getAll();
+      req.onsuccess = () => resolve(req.result);
+      req.onerror = () => reject(req.error);
+    });
+  }
+
+  function getPhoto(id) {
+    return new Promise((resolve, reject) => {
+      const tx = db.transaction(STORE_NAME, 'readonly');
+      const store = tx.objectStore(STORE_NAME);
+      const req = store.get(id);
+      req.onsuccess = () => resolve(req.result);
+      req.onerror = () => reject(req.error);
+    });
+  }
+
+  function deletePhoto(id) {
+    return new Promise((resolve, reject) => {
+      const tx = db.transaction(STORE_NAME, 'readwrite');
+      const store = tx.objectStore(STORE_NAME);
+      const req = store.delete(id);
+      req.onsuccess = () => resolve();
+      req.onerror = () => reject(req.error);
+    });
+  }
+
+  // ------------ UI elements ------------
+  const cameraInput = document.getElementById('cameraInput');
+  const enableCameraBtn = document.getElementById('enableCameraBtn');
+  const openCameraBtn = document.getElementById('openCameraBtn');
+  const exportBtn = document.getElementById('exportBtn');
+  const borderRange = document.getElementById('borderRange');
+  const borderLabel = document.getElementById('borderLabel');
+  const previewCanvas = document.getElementById('previewCanvas');
+  const previewCtx = previewCanvas.getContext('2d');
+  const sourceCanvas = document.getElementById('sourceCanvas');
+  const sourceCtx = sourceCanvas.getContext('2d');
+  const viewer = document.getElementById('viewer');
+  const thumbs = document.getElementById('thumbs');
+  const metaDiv = document.getElementById('meta');
+  const deleteBtn = document.getElementById('deleteBtn');
+  const pointColorInput = document.getElementById('pointColor');
+  const linesSvg = document.getElementById('linesSvg');
+
+  const points = [
+    document.getElementById('p0'),
+    document.getElementById('p1'),
+    document.getElementById('p2'),
+    document.getElementById('p3'),
+  ];
+
+  let selectedRecord = null; // current staged photo object from indexedDB: {id, blob, meta,...}
+  let currentImage = null; // HTMLImageElement loaded from selectedRecord.blob
+  let scaledToCanvas = { sx: 0, sy: 0, sw: 0, sh: 0, scale: 1 }; // mapping from image to displayed canvas
+
+  // Initialize DB and UI
+  openDb().then(refreshThumbs).catch(err => console.error('DB open error', err));
+
+  // ---------------- Camera / File handling ----------------
+  enableCameraBtn.addEventListener('click', async () => {
+    // no direct camera permission API; simulate by prompting geolocation and file input permission
+    // We'll attempt to call getUserMedia to trigger camera permission where available
+    try {
+      if (navigator.mediaDevices && navigator.mediaDevices.getUserMedia) {
+        await navigator.mediaDevices.getUserMedia({ video: true });
+      }
+    } catch (e) {
+      console.warn('Could not access camera via getUserMedia:', e);
+    }
+    // geolocation permission prompt
+    if (navigator.geolocation) {
+      navigator.geolocation.getCurrentPosition(() => {}, () => {}, { timeout: 2000 });
+    }
+    alert('Camera & location prompts (if supported) have been requested. Use "Take Photo" to capture.');
+  });
+
+  openCameraBtn.addEventListener('click', () => cameraInput.click());
+
+  cameraInput.addEventListener('change', async (ev) => {
+    const f = ev.target.files && ev.target.files[0];
+    if (!f) return;
+    // get location if available (we attempt; if denied, we store null)
+    const gps = await getPositionSafe();
+    const meta = { filename: f.name || 'photo', gps, userAgent: navigator.userAgent };
+    // save to IDB as blob
+    const id = await addPhoto(f, meta);
+    await refreshThumbs();
+    // auto-select the newly added
+    const rec = await getPhoto(id);
+    selectRecord(rec);
+    cameraInput.value = ''; // reset
+  });
+
+  function getPositionSafe() {
+    return new Promise((resolve) => {
+      if (!navigator.geolocation) return resolve(null);
+      let called = false;
+      const timer = setTimeout(() => { if (!called) { called = true; resolve(null); } }, 7000);
+      navigator.geolocation.getCurrentPosition((pos) => {
+        if (!called) {
+          called = true; clearTimeout(timer);
+          resolve({ lat: pos.coords.latitude, lon: pos.coords.longitude, accuracy: pos.coords.accuracy, timestamp: pos.timestamp });
+        }
+      }, (err) => { if (!called) { called = true; clearTimeout(timer); resolve(null); } }, { enableHighAccuracy: true, maximumAge: 300000, timeout: 7000 });
+    });
+  }
+
+  // ---------------- Thumbs and selection ----------------
+  async function refreshThumbs() {
+    const list = await getAllPhotos();
+    thumbs.innerHTML = '';
+    for (const rec of list) {
+      const url = URL.createObjectURL(rec.blob);
+      const img = document.createElement('img');
+      img.src = url;
+      img.className = 'thumb';
+      img.title = new Date(rec.timestamp).toLocaleString();
+      img.addEventListener('click', () => selectRecord(rec));
+      thumbs.appendChild(img);
+    }
+  }
+
+  async function selectRecord(rec) {
+    if (!rec) return;
+    selectedRecord = rec;
+    deleteBtn.disabled = false;
+    exportBtn.disabled = false;
+    metaDiv.innerHTML = `<div><strong>Staged:</strong> ${rec.meta.filename || 'photo'} • ${new Date(rec.timestamp).toLocaleString()}</div>`;
+    if (rec.meta.gps) {
+      metaDiv.innerHTML += `<div>GPS: ${rec.meta.gps.lat.toFixed(6)}, ${rec.meta.gps.lon.toFixed(6)} (±${rec.meta.gps.accuracy || 'n/a'}m)</div>`;
+    } else {
+      metaDiv.innerHTML += `<div>GPS: (not available or blocked)</div>`;
+    }
+
+    // load image into canvas
+    if (currentImage) { URL.revokeObjectURL(currentImage.src); currentImage = null; }
+    const imgURL = URL.createObjectURL(rec.blob);
+    const img = new Image();
+    img.onload = () => {
+      currentImage = img;
+      fitImageToCanvas(img);
+      // reset points to image corners by default
+      resetPointsToImage();
+      renderOverlay();
+      updatePreview();
+    };
+    img.src = imgURL;
+  }
+
+  deleteBtn.addEventListener('click', async () => {
+    if (!selectedRecord) return;
+    if (!confirm('Delete staged photo?')) return;
+    await deletePhoto(selectedRecord.id);
+    selectedRecord = null;
+    currentImage = null;
+    clearCanvas();
+    await refreshThumbs();
+    deleteBtn.disabled = true;
+    exportBtn.disabled = true;
+    metaDiv.textContent = '';
+  });
+
+  function clearCanvas() {
+    sourceCtx.clearRect(0,0,sourceCanvas.width, sourceCanvas.height);
+    previewCtx.clearRect(0,0,previewCanvas.width, previewCanvas.height);
+    linesSvg.innerHTML = '';
+  }
+
+  // -------------- Canvas fitting and point coordinate helpers --------------
+  function fitImageToCanvas(img) {
+    // fit inside viewer area but keep natural resolution in canvas (use actual image natural size for processing)
+    // We set canvas width to min(1024, naturalWidth) to avoid too big. We'll still preserve aspect ratio.
+    const maxDisplayW = Math.min(900, window.innerWidth - 40);
+    const devicePixelRatio = window.devicePixelRatio || 1;
+    // We'll use display size equal to min(maxDisplayW, natural width scaled down)
+    const dispW = Math.min(maxDisplayW, img.naturalWidth);
+    const dispH = Math.round(dispW * img.naturalHeight / img.naturalWidth);
+
+    // Set canvas CSS size to display size
+    sourceCanvas.style.width = dispW + 'px';
+    sourceCanvas.style.height = dispH + 'px';
+
+    // For higher quality drawing, set internal pixel size to dispW*ratio
+    const internalW = Math.min(img.naturalWidth, Math.max(800, Math.round(dispW * devicePixelRatio)));
+    const internalH = Math.round(internalW * img.naturalHeight / img.naturalWidth);
+    sourceCanvas.width = internalW;
+    sourceCanvas.height = internalH;
+
+    // draw image to sourceCanvas scaled to internalW/internalH
+    sourceCtx.clearRect(0,0,internalW, internalH);
+    sourceCtx.drawImage(img, 0, 0, internalW, internalH);
+
+    // store mapping from image coordinate space to canvas coordinate space for editing points
+    scaledToCanvas = { sx: 0, sy: 0, sw: internalW, sh: internalH, scale: internalW / img.naturalWidth };
+    // ensure overlay size matches canvas CSS size
+    viewer.style.width = sourceCanvas.style.width;
+    viewer.style.height = sourceCanvas.style.height;
+    // set SVG size attributes for crispness
+    linesSvg.setAttribute('viewBox', `0 0 ${sourceCanvas.clientWidth} ${sourceCanvas.clientHeight}`);
+  }
+
+  function resetPointsToImage() {
+    // set points to the canvas corners in CSS pixel coordinates (client coordinates inside viewer)
+    const w = sourceCanvas.clientWidth;
+    const h = sourceCanvas.clientHeight;
+    setPointPos(0, 0.05 * w, 0.05 * h);
+    setPointPos(1, 0.95 * w, 0.05 * h);
+    setPointPos(2, 0.95 * w, 0.95 * h);
+    setPointPos(3, 0.05 * w, 0.95 * h);
+  }
+
+  function setPointPos(i, cx, cy) {
+    const p = points[i];
+    p.style.left = (cx) + 'px';
+    p.style.top = (cy) + 'px';
+  }
+
+  function getPointPosClient(i) {
+    const b = viewer.getBoundingClientRect();
+    const p = points[i];
+    const px = parseFloat(p.style.left || 0);
+    const py = parseFloat(p.style.top || 0);
+    // px/py are relative to viewer's top-left already (we set them that way)
+    return { x: px, y: py };
+  }
+
+  // get point positions in image coordinate space (matching sourceCanvas internal pixels)
+  function getPointPosImageCoords(i) {
+    const c = getPointPosClient(i);
+    // viewer client size corresponds to sourceCanvas.clientWidth/clientHeight, and internal pixels are sourceCanvas.width/height
+    const scaleX = sourceCanvas.width / sourceCanvas.clientWidth;
+    const scaleY = sourceCanvas.height / sourceCanvas.clientHeight;
+    return { x: c.x * scaleX, y: c.y * scaleY };
+  }
+
+  // ---------------- Draggable points (touch + mouse) ----------------
+  points.forEach((pt, idx) => {
+    let dragging = false;
+    let startOffset = { x: 0, y: 0 };
+
+    function startDrag(clientX, clientY) {
+      dragging = true;
+      pt.style.transition = 'none';
+      const rect = viewer.getBoundingClientRect();
+      const left = parseFloat(pt.style.left || 0);
+      const top = parseFloat(pt.style.top || 0);
+      startOffset.x = clientX - rect.left - left;
+      startOffset.y = clientY - rect.top - top;
+      pt.setPointerCapture && pt.setPointerCapture(dragPointerId);
+    }
+
+    // pointer events
+    pt.addEventListener('pointerdown', (ev) => {
+      ev.preventDefault();
+      pt.setPointerCapture && pt.setPointerCapture(ev.pointerId);
+      dragging = true;
+      pt.style.transition = 'none';
+      const rect = viewer.getBoundingClientRect();
+      const left = parseFloat(pt.style.left || 0);
+      const top = parseFloat(pt.style.top || 0);
+      startOffset.x = ev.clientX - rect.left - left;
+      startOffset.y = ev.clientY - rect.top - top;
+    });
+
+    window.addEventListener('pointermove', (ev) => {
+      if (!dragging) return;
+      if (ev.buttons === 0) { dragging = false; return; }
+      const rect = viewer.getBoundingClientRect();
+      let nx = ev.clientX - rect.left - startOffset.x;
+      let ny = ev.clientY - rect.top - startOffset.y;
+      // keep inside viewer
+      nx = Math.max(0, Math.min(rect.width, nx));
+      ny = Math.max(0, Math.min(rect.height, ny));
+      pt.style.left = nx + 'px';
+      pt.style.top = ny + 'px';
+      renderOverlay();
+      updatePreview();
+    });
+
+    window.addEventListener('pointerup', (ev) => {
+      dragging = false;
+      pt.releasePointerCapture && pt.releasePointerCapture(ev.pointerId);
+    });
+
+    // Touch fallback for older browsers
+    pt.addEventListener('touchstart', (ev) => {
+      ev.preventDefault();
+      const t = ev.touches[0];
+      startDrag(t.clientX, t.clientY);
+    }, { passive:false });
+
+    window.addEventListener('touchmove', (ev) => {
+      if (!dragging) return;
+      ev.preventDefault();
+      const t = ev.touches[0];
+      const rect = viewer.getBoundingClientRect();
+      let nx = t.clientX - rect.left - startOffset.x;
+      let ny = t.clientY - rect.top - startOffset.y;
+      nx = Math.max(0, Math.min(rect.width, nx));
+      ny = Math.max(0, Math.min(rect.height, ny));
+      pt.style.left = nx + 'px';
+      pt.style.top = ny + 'px';
+      renderOverlay();
+      updatePreview();
+    }, { passive:false });
+
+    pt.addEventListener('touchend', (ev) => { dragging = false; });
+  });
+
+  // ---------------- Render overlay lines ----------------
+  function renderOverlay() {
+    // draw polygon lines on SVG
+    const w = sourceCanvas.clientWidth;
+    const h = sourceCanvas.clientHeight;
+    linesSvg.innerHTML = '';
+    const poly = document.createElementNS('http://www.w3.org/2000/svg','polygon');
+    const pts = points.map((_,i)=> {
+      const p = getPointPosClient(i);
+      return `${p.x},${p.y}`;
+    }).join(' ');
+    poly.setAttribute('points', pts);
+    poly.setAttribute('fill', 'none');
+    const color = pointColorInput.value || '#ffcc00';
+    poly.setAttribute('stroke', color);
+    poly.setAttribute('stroke-width', '3');
+    poly.setAttribute('stroke-linejoin', 'round');
+    linesSvg.appendChild(poly);
+    // update point color
+    points.forEach(p => { p.style.background = pointColorInput.value; });
+  }
+  pointColorInput.addEventListener('input', renderOverlay);
+
+  // ---------------- Preview & rectification ----------------
+  borderRange.addEventListener('input', ()=> {
+    borderLabel.textContent = borderRange.value;
+    updatePreview();
+  });
+
+  function updatePreview() {
+    if (!currentImage) return;
+    // compute source quad in image internal pixel coords
+    const src = [];
+    for (let i=0;i<4;i++) src.push(getPointPosImageCoords(i));
+
+    // compute destination rectangle size
+    const topWidth = dist(src[0], src[1]);
+    const botWidth = dist(src[3], src[2]);
+    const leftHeight = dist(src[0], src[3]);
+    const rightHeight = dist(src[1], src[2]);
+    let dstW = Math.round((topWidth + botWidth) / 2);
+    let dstH = Math.round((leftHeight + rightHeight) / 2);
+    if (dstW < 10) dstW = 10;
+    if (dstH < 10) dstH = 10;
+
+    // add border percentage
+    const borderPct = parseFloat(borderRange.value || 0) / 100;
+    const borderPx = Math.round(Math.max(dstW, dstH) * borderPct);
+    dstW += borderPx*2;
+    dstH += borderPx*2;
+
+    // destination rectangle corners (in image-space)
+    const dst = [
+      { x: borderPx, y: borderPx },               // top-left
+      { x: borderPx + dstW - 1 - 2*borderPx + (dstW - 2*borderPx - 1) , y: borderPx }, // we will compute simple rect:
+      // simpler: just set dst corners to produce rect with width dstW and height dstH
+      { x: borderPx + dstW - 1, y: borderPx + dstH - 1 },
+      { x: borderPx, y: borderPx + dstH - 1 }
+    ];
+    // Note: Above had overcomplication; rewrite dst properly:
+    dst[0] = { x: 0, y: 0 };
+    dst[1] = { x: dstW - 1, y: 0 };
+    dst[2] = { x: dstW - 1, y: dstH - 1 };
+    dst[3] = { x: 0, y: dstH - 1 };
+
+    // draw using two-triangle affine approximation
+    const result = rectifyQuadToRect(currentImage, src, dst, dstW, dstH);
+    // result is an ImageBitmap or canvas; draw to preview canvas scaled to fit
+    previewCanvas.width = dstW;
+    previewCanvas.height = dstH;
+    // scale preview to fit container (CSS handles it)
+    previewCtx.clearRect(0,0,previewCanvas.width, previewCanvas.height);
+    previewCtx.drawImage(result, 0, 0);
+
+    // update export button metadata
+    previewCanvas.toBlob(blob => {
+      if (blob) {
+        exportBtn.disabled = false;
+      }
+    }, 'image/jpeg', 0.92);
+  }
+
+  // Utility: euclidean distance
+  function dist(a,b) { const dx=a.x-b.x, dy=a.y-b.y; return Math.sqrt(dx*dx+dy*dy); }
+
+  // Rectify: we approximate perspective by splitting quad into two triangles and applying triangle affine transforms.
+  // currentImage: HTMLImageElement; src: array of 4 points in image internal pixel space; dst: 4 points defining rectangle
+  function rectifyQuadToRect(img, src, dst, dstW, dstH) {
+    // create an offscreen canvas sized to dstW/dstH
+    const off = document.createElement('canvas');
+    off.width = dstW;
+    off.height = dstH;
+    const ctx = off.getContext('2d');
+    // triangles: (0,1,2) and (0,2,3)
+    const tris = [
+      { s: [src[0], src[1], src[2]], d: [dst[0], dst[1], dst[2]] },
+      { s: [src[0], src[2], src[3]], d: [dst[0], dst[2], dst[3]] }
+    ];
+    // For each triangle, compute affine transform mapping src->dst and draw clipped
+    for (const t of tris) {
+      // compute bounding box of destination triangle to optimize
+      const minX = Math.floor(Math.min(t.d[0].x, t.d[1].x, t.d[2].x));
+      const minY = Math.floor(Math.min(t.d[0].y, t.d[1].y, t.d[2].y));
+      const maxX = Math.ceil(Math.max(t.d[0].x, t.d[1].x, t.d[2].x));
+      const maxY = Math.ceil(Math.max(t.d[0].y, t.d[1].y, t.d[2].y));
+      if (maxX <= minX || maxY <= minY) continue;
+
+      ctx.save();
+      // create clipping path from destination triangle (in off canvas coordinates)
+      ctx.beginPath();
+      ctx.moveTo(t.d[0].x, t.d[0].y);
+      ctx.lineTo(t.d[1].x, t.d[1].y);
+      ctx.lineTo(t.d[2].x, t.d[2].y);
+      ctx.closePath();
+      ctx.clip();
+
+      // compute affine transform matrix that maps source triangle to destination triangle
+      const M = computeAffineTransform(t.s, t.d);
+      // M is {a,b,c,d,e,f} such that x' = a*x + c*y + e; y' = b*x + d*y + f
+      // We want to set transform so that drawing the source image with ctx.transform maps source-image coords into destination.
+      // But drawImage uses image coordinates starting at 0..img.width. We'll use drawImage(img, 0,0,imgW,imgH, 0,0,imgW,imgH)
+      // Instead, use setTransform to map image-space coordinates to destination-space, then draw the image.
+      ctx.setTransform(M.a, M.b, M.c, M.d, M.e, M.f);
+      // draw the full source image (in image internal pixel coordinates) so transform maps it into place
+      ctx.drawImage(img, 0, 0, sourceCanvas.width, sourceCanvas.height); // sourceCanvas.width approximates image internal pixel size
+      ctx.restore();
+    }
+    return off;
+  }
+
+  // Compute affine transform mapping triangle src->dst
+  // src and dst are arrays [{x,y}, {x,y}, {x,y}]
+  // solves for a,b,c,d,e,f in:
+  // x' = a*x + c*y + e
+  // y' = b*x + d*y + f
+  function computeAffineTransform(srcTri, dstTri) {
+    // set up linear system A * m = B where m = [a,b,c,d,e,f]
+    // For each pair (x,y)->(x',y'):
+    // [ x 0 y 0 1 0 ] [a] = [x']
+    // [ 0 x 0 y 0 1 ] [b]   [y']
+    // But easier: build 6x6 matrix
+    const A = [];
+    const B = [];
+    for (let i=0;i<3;i++) {
+      const xs = srcTri[i].x;
+      const ys = srcTri[i].y;
+      const xd = dstTri[i].x;
+      const yd = dstTri[i].y;
+      A.push([xs, 0, ys, 0, 1, 0]);
+      B.push(xd);
+      A.push([0, xs, 0, ys, 0, 1]);
+      B.push(yd);
+    }
+    // Solve 6x6 system via Gauss elimination
+    const M = gaussianSolve(A, B); // returns array length 6
+    if (!M) return {a:1,b:0,c:0,d:1,e:0,f:0};
+    return { a: M[0], b: M[1], c: M[2], d: M[3], e: M[4], f: M[5] };
+  }
+
+  // simple Gaussian elimination for square system
+  function gaussianSolve(A, B) {
+    const n = A.length;
+    // convert to augmented matrix
+    const M = [];
+    for (let i=0;i<n;i++) M.push(A[i].slice().concat([B[i]]));
+    // forward elimination
+    for (let i=0;i<n;i++) {
+      // find pivot
+      let maxRow = i;
+      for (let k=i+1;k<n;k++) {
+        if (Math.abs(M[k][i]) > Math.abs(M[maxRow][i])) maxRow = k;
+      }
+      if (Math.abs(M[maxRow][i]) < 1e-12) return null; // singular
+      // swap
+      const tmp = M[i]; M[i] = M[maxRow]; M[maxRow] = tmp;
+      // normalize and eliminate
+      const pivot = M[i][i];
+      for (let j=i;j<=n;j++) M[i][j] /= pivot;
+      for (let r=0;r<n;r++) {
+        if (r===i) continue;
+        const f = M[r][i];
+        for (let c=i;c<=n;c++) M[r][c] -= f * M[i][c];
+      }
+    }
+    // extract solution
+    const sol = new Array(n);
+    for (let i=0;i<n;i++) sol[i] = M[i][n];
+    return sol;
+  }
+
+  // ----------------- Export logic -----------------
+  exportBtn.addEventListener('click', async () => {
+    if (!selectedRecord) return alert('No staged photo selected');
+    // create rectified blob from previewCanvas (highest quality)
+    const quality = 0.92;
+    previewCanvas.toBlob(async (blob) => {
+      if (!blob) return alert('Failed to create rectified image');
+      // Create downloadable link and click to trigger Safari's download/save UI
+      const filename = `rectified_${selectedRecord.id}_${Date.now()}.jpg`;
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = filename;
+      // For Safari on iOS, force opening in new tab may present Save Image; but the download attribute often triggers "Share" UI.
+      document.body.appendChild(a);
+      a.click();
+      setTimeout(()=>{ document.body.removeChild(a); }, 500);
+      // After export initiated, delete original from IDB
+      try {
+        await deletePhoto(selectedRecord.id);
+        alert('Original staged photo deleted from storage (staged). Remember to save the exported image to Photos from the Safari UI.');
+        selectedRecord = null;
+        currentImage = null;
+        deleteBtn.disabled = true;
+        exportBtn.disabled = true;
+        metaDiv.textContent = '';
+        await refreshThumbs();
+        clearCanvas();
+      } catch (e) {
+        console.error('Error deleting after export', e);
+      } finally {
+        URL.revokeObjectURL(url);
+      }
+    }, 'image/jpeg', quality);
+  });
+
+  // ----------------- Initial rendering housekeeping -----------------
+  function renderAll() {
+    renderOverlay();
+    updatePreview();
+  }
+
+  // initial render
+  window.addEventListener('resize', () => {
+    if (currentImage) fitImageToCanvas(currentImage);
+    renderOverlay();
+    updatePreview();
+  });
+
+  // helper: draw sourceCanvas contents at current internal resolution
+  function redrawSourceFromImage() {
+    if (!currentImage) return;
+    sourceCtx.clearRect(0,0,sourceCanvas.width,sourceCanvas.height);
+    sourceCtx.drawImage(currentImage, 0, 0, sourceCanvas.width, sourceCanvas.height);
+  }
+
+  // whenever overlay changes, optionally redraw preview
+  // attach small interval to update
+  setInterval(()=> { renderOverlay(); updatePreview(); }, 700);
+
+  // On load: ensure everything is in reasonable state
+  clearCanvas();
+
+  // expose some utility to window for debugging
+  window.PR = {
+    dbName: DB_NAME, openDb, addPhoto, getAllPhotos, getPhoto, deletePhoto
+  };
+
+})();
+</script>
+</body>
+</html>
