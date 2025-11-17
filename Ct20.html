@@ -1,0 +1,706 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>Image Rectifier</title>
+<style>
+  :root{
+    --ctrl-size: 22px;
+    --ctrl-offset: 28px; /* how far control squares sit outside crosshair */
+  }
+  body{font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; margin:12px; color:#111;}
+  h1{font-size:1.1rem;margin:0 0 8px}
+  #topbar{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:8px}
+  button, label.inputBtn{padding:8px 10px;border-radius:6px;border:1px solid #ccc;background:#fff;cursor:pointer}
+  .small{font-size:0.9rem;padding:6px 8px}
+  #gps{font-size:0.9rem;color:#333;margin-bottom:8px}
+  #canvasWrap{position:relative;display:inline-block;border:1px solid #ddd;max-width:100%}
+  canvas#mainCanvas{display:block;max-width:100%;height:auto}
+  /* overlays are drawn into an overlay canvas sized same as image canvas */
+  canvas#overlay{position:absolute;left:0;top:0;pointer-events:none}
+  .controlsRow{display:flex;gap:8px;margin-top:8px;align-items:center}
+  #rectifiedImg{display:block;margin-top:12px;max-width:100%;border:1px solid #ccc}
+  .meta{font-size:0.85rem;color:#444;margin-left:6px}
+  .handle{
+    position:absolute;
+    width:var(--ctrl-size);
+    height:var(--ctrl-size);
+    background:#fff;
+    border:2px solid #222;
+    box-sizing:border-box;
+    transform:translate(-50%,-50%);
+    touch-action:none;
+    border-radius:3px;
+    z-index:20;
+    display:flex;
+    align-items:center;
+    justify-content:center;
+    font-size:12px;
+    color:#222;
+  }
+  .crosshairDot{
+    position:absolute;
+    width:18px;height:18px;
+    transform:translate(-50%,-50%);
+    pointer-events:none;
+    z-index:15;
+  }
+  #storedList{margin-top:8px;font-size:0.9rem}
+  .rowItem{display:flex;gap:8px;align-items:center;margin:4px 0}
+  .smallText{font-size:0.85rem;color:#555}
+</style>
+</head>
+<body>
+  <h1>Image Rectifier</h1>
+
+  <div id="topbar">
+    <label class="inputBtn">
+      Capture / Choose Image
+      <input id="fileInput" type="file" accept="image/*" capture="environment" style="display:none" />
+    </label>
+    <button id="saveOriginal" class="small">Save original to DB</button>
+    <button id="shareBtn" class="small">Share rectified image</button>
+    <button id="listBtn" class="small">Show stored originals</button>
+    <span class="meta" id="status">idle</span>
+  </div>
+
+  <div id="gps">GPS: <span id="gpsInfo">unknown</span></div>
+
+  <div id="canvasWrap">
+    <canvas id="mainCanvas"></canvas>
+    <canvas id="overlay"></canvas>
+    <!-- handle elements (square controls) - generated dynamically -->
+  </div>
+
+  <img id="rectifiedImg" alt="Rectified result (live)">
+
+  <div id="storedList"></div>
+
+<script>
+/* ======= Globals & helpers ======= */
+const fileInput = document.getElementById('fileInput');
+const mainCanvas = document.getElementById('mainCanvas');
+const overlay = document.getElementById('overlay');
+const ctx = mainCanvas.getContext('2d',{willReadFrequently:true});
+const overlayCtx = overlay.getContext('2d');
+const canvasWrap = document.getElementById('canvasWrap');
+const gpsInfoSpan = document.getElementById('gpsInfo');
+const saveBtn = document.getElementById('saveOriginal');
+const shareBtn = document.getElementById('shareBtn');
+const statusSpan = document.getElementById('status');
+const rectifiedImgEl = document.getElementById('rectifiedImg');
+const storedListDiv = document.getElementById('storedList');
+const listBtn = document.getElementById('listBtn');
+
+let currentImage = null; // Image object
+let imageBlob = null; // original blob
+let imgNaturalSize = {w:0,h:0};
+let devicePixelRatioScale = window.devicePixelRatio || 1;
+let gps = null;
+let handles = []; // DOM elements for square handles
+let crosshairPoints = []; // {x,y} in image coords (pixels)
+const ctrlSize = parseInt(getComputedStyle(document.documentElement).getPropertyValue('--ctrl-size')) || 22;
+const ctrlOffset = parseInt(getComputedStyle(document.documentElement).getPropertyValue('--ctrl-offset')) || 28;
+const BORDER_RATIO = 0.10; // 10% border
+
+/* IndexedDB minimal wrapper */
+const DB_NAME = 'rectifier_db';
+const STORE_NAME = 'images';
+function openDB(){
+  return new Promise((res,rej)=>{
+    const r = indexedDB.open(DB_NAME,1);
+    r.onupgradeneeded = (e)=> {
+      const db = e.target.result;
+      if(!db.objectStoreNames.contains(STORE_NAME)){
+        const s = db.createObjectStore(STORE_NAME,{keyPath:'id',autoIncrement:true});
+        s.createIndex('ts','ts',{});
+      }
+    };
+    r.onsuccess = ()=> res(r.result);
+    r.onerror = (e)=> rej(e);
+  });
+}
+async function saveOriginalToDB(blob, metadata={}){
+  const db = await openDB();
+  return new Promise((res,rej)=>{
+    const tx = db.transaction(STORE_NAME,'readwrite');
+    const store = tx.objectStore(STORE_NAME);
+    const item = {blob, metadata, ts:Date.now()};
+    const req = store.add(item);
+    req.onsuccess = ()=> res(req.result);
+    req.onerror = (e)=> rej(e);
+  });
+}
+async function listStored(){
+  const db = await openDB();
+  return new Promise((res,rej)=>{
+    const tx = db.transaction(STORE_NAME,'readonly');
+    const store = tx.objectStore(STORE_NAME);
+    const arr = [];
+    store.openCursor().onsuccess = function(e){
+      const cur = e.target.result;
+      if(cur){ arr.push({id:cur.key, ...cur.value}); cur.continue(); }
+      else res(arr);
+    };
+    tx.onerror = (e)=> rej(e);
+  });
+}
+async function deleteStored(id){
+  const db = await openDB();
+  return new Promise((res,rej)=>{
+    const tx = db.transaction(STORE_NAME,'readwrite');
+    tx.objectStore(STORE_NAME).delete(id).onsuccess = ()=> res();
+    tx.onerror = (e)=> rej(e);
+  });
+}
+
+/* ======= Loading image and setting up points ======= */
+fileInput.addEventListener('change', async (ev) => {
+  const f = ev.target.files && ev.target.files[0];
+  if(!f) return;
+  imageBlob = f;
+  status('loading image...');
+  const img = new Image();
+  img.onload = () => {
+    currentImage = img;
+    imgNaturalSize = {w: img.naturalWidth, h: img.naturalHeight};
+    setupCanvasForImage(img);
+    initCrosshairsCentered();
+    drawImage();
+    drawOverlay();
+    computeRectifiedAndShow();
+    status('image loaded');
+  };
+  img.onerror = (e) => { status('image failed to load'); console.error(e); };
+  img.src = URL.createObjectURL(f);
+  // get gps at time of import
+  acquireGPS();
+});
+
+/* Put the image into canvas and size things */
+function setupCanvasForImage(img){
+  // we'll show image scaled to fit width ~ min(900, container)
+  const maxW = Math.min(window.innerWidth - 40, 900);
+  const scale = Math.min(maxW / img.naturalWidth, 1);
+  const displayW = Math.round(img.naturalWidth * scale);
+  const displayH = Math.round(img.naturalHeight * scale);
+  // set canvas sizes accounting for devicePixelRatio for crispness
+  const DPR = devicePixelRatioScale;
+  mainCanvas.width = displayW * DPR;
+  mainCanvas.height = displayH * DPR;
+  mainCanvas.style.width = displayW + 'px';
+  mainCanvas.style.height = displayH + 'px';
+  overlay.width = mainCanvas.width;
+  overlay.height = mainCanvas.height;
+  overlay.style.width = mainCanvas.style.width;
+  overlay.style.height = mainCanvas.style.height;
+  canvasWrap.style.width = displayW + 'px';
+  canvasWrap.style.height = displayH + 'px';
+  // scale drawing context
+  ctx.setTransform(DPR,0,0,DPR,0,0);
+  overlayCtx.setTransform(DPR,0,0,DPR,0,0);
+}
+
+/* initial crosshairs at 50% of image size as points for rectification
+   Interpreting "50% of the image size as the points" as placing four
+   points centered (a smaller rectangle centered at 50% scale of the image)
+*/
+function initCrosshairsCentered(){
+  const W = mainCanvas.width / devicePixelRatioScale;
+  const H = mainCanvas.height / devicePixelRatioScale;
+  const halfScale = 0.5;
+  const boxW = W * halfScale;
+  const boxH = H * halfScale;
+  const left = (W - boxW)/2;
+  const top = (H - boxH)/2;
+  // order: tl, tr, br, bl
+  crosshairPoints = [
+    {x: left, y: top},
+    {x: left + boxW, y: top},
+    {x: left + boxW, y: top + boxH},
+    {x: left, y: top + boxH}
+  ];
+  // remove any old handles
+  removeHandles();
+  // create square control handles outside these points
+  crosshairPoints.forEach((p, i) => createHandleAt(p,i));
+}
+
+/* create square handle DOM and attach dragging */
+function createHandleAt(point, idx){
+  const handle = document.createElement('div');
+  handle.className = 'handle';
+  handle.dataset.idx = idx;
+  handle.innerText = idx+1;
+  canvasWrap.appendChild(handle);
+  handles[idx] = handle;
+  positionHandleElement(handle, point);
+  // pointer events
+  handle.addEventListener('pointerdown', onPointerDown);
+  handle.addEventListener('touchstart', (e)=>e.preventDefault(), {passive:false});
+}
+
+function removeHandles(){
+  handles.forEach(h=>{ if(h && h.parentNode) h.parentNode.removeChild(h); });
+  handles = [];
+}
+function positionHandleElement(handleEl, point){
+  // place handle outside the crosshair: offset radially outward from image center
+  const W = mainCanvas.width / devicePixelRatioScale;
+  const H = mainCanvas.height / devicePixelRatioScale;
+  const cx = W/2, cy = H/2;
+  const dx = point.x - cx, dy = point.y - cy;
+  const len = Math.hypot(dx,dy) || 1;
+  const ux = dx / len, uy = dy / len;
+  const outX = point.x + ux * ctrlOffset;
+  const outY = point.y + uy * ctrlOffset;
+  handleEl.style.left = outX + 'px';
+  handleEl.style.top = outY + 'px';
+  // ensure a crosshair dot is visible at the point (so finger doesn't hide it)
+  let dot = handleEl._dot;
+  if(!dot){
+    dot = document.createElement('div');
+    dot.className = 'crosshairDot';
+    canvasWrap.appendChild(dot);
+    handleEl._dot = dot;
+  }
+  dot.style.left = point.x + 'px';
+  dot.style.top = point.y + 'px';
+  // draw crosshair visuals small: using CSS border lines
+  dot.innerHTML = `<svg width="18" height="18" viewBox="0 0 18 18">
+    <line x1="9" y1="0" x2="9" y2="6" stroke="#e00" stroke-width="2"/>
+    <line x1="9" y1="12" x2="9" y2="18" stroke="#e00" stroke-width="2"/>
+    <line x1="0" y1="9" x2="6" y2="9" stroke="#e00" stroke-width="2"/>
+    <line x1="12" y1="9" x2="18" y2="9" stroke="#e00" stroke-width="2"/>
+    <circle cx="9" cy="9" r="2" fill="#fff" stroke="#e00" stroke-width="1"/>
+  </svg>`;
+}
+
+/* pointer dragging */
+let active = null;
+function onPointerDown(e){
+  e.preventDefault();
+  const el = e.currentTarget;
+  const idx = Number(el.dataset.idx);
+  active = {el, idx, startClientX:e.clientX, startClientY:e.clientY};
+  el.setPointerCapture(e.pointerId);
+  const move = (ev)=> onPointerMove(ev);
+  const up = (ev)=> onPointerUp(ev);
+  window.addEventListener('pointermove', move);
+  window.addEventListener('pointerup', up, {once:true});
+  window.addEventListener('pointercancel', up, {once:true});
+  function onPointerMove(ev){
+    if(!active) return;
+    // convert client coords to canvas image coords
+    const rect = mainCanvas.getBoundingClientRect();
+    const x = (ev.clientX - rect.left);
+    const y = (ev.clientY - rect.top);
+    // clamp inside canvas
+    const W = mainCanvas.width / devicePixelRatioScale;
+    const H = mainCanvas.height / devicePixelRatioScale;
+    const nx = Math.max(0, Math.min(W, x));
+    const ny = Math.max(0, Math.min(H, y));
+    crosshairPoints[active.idx].x = nx;
+    crosshairPoints[active.idx].y = ny;
+    // reposition handle and dot
+    positionHandleElement(active.el, crosshairPoints[active.idx]);
+    drawOverlay();
+    computeRectifiedAndShow();
+  }
+  function onPointerUp(ev){
+    window.removeEventListener('pointermove', move);
+    active.el.releasePointerCapture && active.el.releasePointerCapture(ev.pointerId);
+    active = null;
+  }
+}
+
+/* draw image into main canvas and overlay crosshair outlines */
+function drawImage(){
+  // clear and draw
+  ctx.clearRect(0,0,mainCanvas.width, mainCanvas.height);
+  // draw scaled image to fit
+  const dispW = parseFloat(mainCanvas.style.width);
+  const dispH = parseFloat(mainCanvas.style.height);
+  ctx.drawImage(currentImage, 0, 0, dispW, dispH);
+}
+
+/* overlay: draw lines connecting crosshairs and small markers */
+function drawOverlay(){
+  overlayCtx.clearRect(0,0,overlay.width,overlay.height);
+  // draw quad lines
+  overlayCtx.lineWidth = 2;
+  overlayCtx.strokeStyle = 'rgba(0,0,0,0.6)';
+  overlayCtx.beginPath();
+  crosshairPoints.forEach((p,i)=>{
+    if(i===0) overlayCtx.moveTo(p.x,p.y);
+    else overlayCtx.lineTo(p.x,p.y);
+  });
+  overlayCtx.closePath();
+  overlayCtx.stroke();
+  // small circles at the points (they are drawn via crosshair dots too)
+  overlayCtx.fillStyle = 'rgba(255,0,0,0.85)';
+  crosshairPoints.forEach(p=>{
+    overlayCtx.beginPath();
+    overlayCtx.arc(p.x,p.y,4,0,Math.PI*2);
+    overlayCtx.fill();
+  });
+}
+
+/* ======= Perspective / Homography and rectification =======
+We compute homography mapping from the quadrilateral (current display coords) to a rectangle.
+We:
+ - compute bounding box of the 4 points
+ - expand by BORDER_RATIO (10%) in both width & height
+ - target rectangle size computed from expanded box aspect ratio
+ - compute homography H that maps quad -> target rectangle
+ - render result by inverse-mapping pixels using bilinear interpolation
+*/
+function computeRectifiedAndShow(){
+  if(!currentImage) return;
+  // compute bounding box of quad in display coords
+  const pts = crosshairPoints.map(p=>({x:p.x, y:p.y}));
+  const minX = Math.min(...pts.map(p=>p.x));
+  const maxX = Math.max(...pts.map(p=>p.x));
+  const minY = Math.min(...pts.map(p=>p.y));
+  const maxY = Math.max(...pts.map(p=>p.y));
+  let w = maxX - minX;
+  let h = maxY - minY;
+  if(w < 10 || h < 10) return;
+  // expand by border ratio
+  const padW = w * BORDER_RATIO;
+  const padH = h * BORDER_RATIO;
+  const outMinX = Math.max(0, minX - padW);
+  const outMinY = Math.max(0, minY - padH);
+  const outMaxX = Math.min(mainCanvas.width / devicePixelRatioScale, maxX + padW);
+  const outMaxY = Math.min(mainCanvas.height / devicePixelRatioScale, maxY + padH);
+  const outW = Math.round(outMaxX - outMinX);
+  const outH = Math.round(outMaxY - outMinY);
+  if(outW <= 0 || outH <= 0) return;
+  // source quad points in display coordinates
+  const srcQuad = pts;
+  // destination rectangle points in display coords (top-left origin)
+  const dstRect = [
+    {x: 0, y: 0},
+    {x: outW, y: 0},
+    {x: outW, y: outH},
+    {x: 0, y: outH}
+  ];
+  // but mapping should consider that srcQuad coordinates are absolute on canvas,
+  // while destination will be relative to outMinX/outMinY. So subtract outMinX/outMinY from srcQuad
+  const srcAdjusted = srcQuad.map(p=>({x: p.x - outMinX, y: p.y - outMinY}));
+  // create an offscreen canvas to draw the portion of the original image (cropped bounding box)
+  const cropCanvas = document.createElement('canvas');
+  cropCanvas.width = outW;
+  cropCanvas.height = outH;
+  const cc = cropCanvas.getContext('2d');
+  // draw the corresponding area of the original image onto cropCanvas at the right scale
+  // to do that, we draw from mainCanvas the rectangle [outMinX, outMinY, outW, outH]
+  // note: mainCanvas currently contains the displayed image (scaled). We'll use getImageData from it.
+  const DPR = devicePixelRatioScale;
+  // get pixel data of the display portion (account for DPR)
+  const sx = Math.round(outMinX * DPR), sy = Math.round(outMinY * DPR);
+  const sw = Math.round(outW * DPR), sh = Math.round(outH * DPR);
+  const srcImgData = ctx.getImageData(sx/DPR * DPR, sy/DPR * DPR, sw, sh); // using ctx directly, simpler:
+  // unfortunately getImageData coordinates already expect CSS pixels because ctx has been scaled by DPR.
+  // Simpler: draw from the original (currentImage) scaled into cropCanvas using drawImage with correct mapping:
+  const displayImageW = parseFloat(mainCanvas.style.width);
+  const displayImageH = parseFloat(mainCanvas.style.height);
+  // compute mapping from displayed image coordinates to original image pixel coordinates:
+  const sx_img = (outMinX / displayImageW) * currentImage.naturalWidth;
+  const sy_img = (outMinY / displayImageH) * currentImage.naturalHeight;
+  const sw_img = (outW / displayImageW) * currentImage.naturalWidth;
+  const sh_img = (outH / displayImageH) * currentImage.naturalHeight;
+  // draw that portion of the natural image scaled to cropCanvas
+  cc.drawImage(currentImage, sx_img, sy_img, sw_img, sh_img, 0, 0, outW, outH);
+
+  // compute homography H mapping srcAdjusted -> dstRect
+  const H = findHomography(srcAdjusted, dstRect);
+  if(!H) { console.warn('homography failed'); return; }
+  const Hinv = invertHomography(H);
+
+  // create destination offscreen canvas
+  const destCanvas = document.createElement('canvas');
+  destCanvas.width = outW;
+  destCanvas.height = outH;
+  const dc = destCanvas.getContext('2d');
+  // get source pixel data for sampling
+  const srcData = cc.getImageData(0,0,outW,outH);
+  const destImageData = dc.createImageData(outW,outH);
+
+  // inverse map: iterate over dest pixels, find src via Hinv
+  const sdata = srcData.data, ddata = destImageData.data;
+  for(let y=0;y<outH;y++){
+    for(let x=0;x<outW;x++){
+      const idx = (y*outW + x)*4;
+      // map dest (x,y,1) -> src using Hinv
+      const srcP = applyHomography(Hinv, {x:x, y:y});
+      const sxF = srcP.x, syF = srcP.y;
+      // sample bilinear from srcData
+      if(sxF >= 0 && sxF < outW-1 && syF >=0 && syF < outH-1){
+        const sx0 = Math.floor(sxF), sy0 = Math.floor(syF);
+        const dxp = sxF - sx0, dyp = syF - sy0;
+        const i00 = (sy0*outW + sx0)*4;
+        const i10 = (sy0*outW + (sx0+1))*4;
+        const i01 = ((sy0+1)*outW + sx0)*4;
+        const i11 = ((sy0+1)*outW + (sx0+1))*4;
+        for(let c=0;c<4;c++){
+          const v00 = sdata[i00 + c], v10 = sdata[i10 + c], v01 = sdata[i01 + c], v11 = sdata[i11 + c];
+          const v0 = v00*(1-dxp) + v10*dxp;
+          const v1 = v01*(1-dxp) + v11*dxp;
+          const v = v0*(1-dyp) + v1*dyp;
+          ddata[idx + c] = Math.round(v);
+        }
+      } else {
+        // outside: transparent
+        ddata[idx]=0; ddata[idx+1]=0; ddata[idx+2]=0; ddata[idx+3]=0;
+      }
+    }
+  }
+  dc.putImageData(destImageData, 0, 0);
+  // convert to data URL and show below
+  destCanvas.toBlob((blob)=>{
+    if(!blob) return;
+    const url = URL.createObjectURL(blob);
+    rectifiedImgEl.src = url;
+    rectifiedImgEl._blob = blob;
+    // store also for share button
+  }, 'image/jpeg', 0.92);
+}
+
+/* ===== Homography linear algebra utilities ===== */
+/* findHomography: given srcPts (4) and dstPts (4) arrays of {x,y}, solve 8x8 for H (3x3 with h33=1).
+   returns 3x3 matrix as [ [h00,h01,h02],[h10,h11,h12],[h20,h21,h22] ]
+*/
+function findHomography(src, dst){
+  if(src.length !== 4 || dst.length !== 4) return null;
+  // Build linear system A * h = b (8 equations, 8 unknowns: h00..h21 with h22=1)
+  // For each point: [ x y 1 0 0 0 -x'x -x'y ] * hVec = x'
+  //                 [ 0 0 0 x y 1 -y'x -y'y ] * hVec = y'
+  const A = [];
+  const b = [];
+  for(let i=0;i<4;i++){
+    const xs = src[i].x, ys = src[i].y;
+    const xd = dst[i].x, yd = dst[i].y;
+    A.push([xs, ys, 1, 0, 0, 0, -xs*xd, -ys*xd]);
+    b.push(xd);
+    A.push([0,0,0,xs,ys,1, -xs*yd, -ys*yd]);
+    b.push(yd);
+  }
+  // solve via gaussian elimination for 8 unknowns
+  const hVec = solveLinearSystem(A, b);
+  if(!hVec) return null;
+  const H = [
+    [hVec[0], hVec[1], hVec[2]],
+    [hVec[3], hVec[4], hVec[5]],
+    [hVec[6], hVec[7], 1]
+  ];
+  return H;
+}
+
+function applyHomography(H, p){
+  const x = p.x, y = p.y;
+  const z = H[2][0]*x + H[2][1]*y + H[2][2];
+  if(z === 0) return {x:0,y:0};
+  const nx = (H[0][0]*x + H[0][1]*y + H[0][2]) / z;
+  const ny = (H[1][0]*x + H[1][1]*y + H[1][2]) / z;
+  return {x:nx, y:ny};
+}
+
+/* invert 3x3 homography by analytic inverse */
+function invertHomography(H){
+  // convert to array
+  const a = H;
+  const det =
+    a[0][0]*(a[1][1]*a[2][2] - a[1][2]*a[2][1]) -
+    a[0][1]*(a[1][0]*a[2][2] - a[1][2]*a[2][0]) +
+    a[0][2]*(a[1][0]*a[2][1] - a[1][1]*a[2][0]);
+  if(Math.abs(det) < 1e-12) return null;
+  const inv = [[0,0,0],[0,0,0],[0,0,0]];
+  inv[0][0] =  (a[1][1]*a[2][2] - a[1][2]*a[2][1]) / det;
+  inv[0][1] = -(a[0][1]*a[2][2] - a[0][2]*a[2][1]) / det;
+  inv[0][2] =  (a[0][1]*a[1][2] - a[0][2]*a[1][1]) / det;
+  inv[1][0] = -(a[1][0]*a[2][2] - a[1][2]*a[2][0]) / det;
+  inv[1][1] =  (a[0][0]*a[2][2] - a[0][2]*a[2][0]) / det;
+  inv[1][2] = -(a[0][0]*a[1][2] - a[0][2]*a[1][0]) / det;
+  inv[2][0] =  (a[1][0]*a[2][1] - a[1][1]*a[2][0]) / det;
+  inv[2][1] = -(a[0][0]*a[2][1] - a[0][1]*a[2][0]) / det;
+  inv[2][2] =  (a[0][0]*a[1][1] - a[0][1]*a[1][0]) / det;
+  return inv;
+}
+
+/* simple gaussian elimination solver for Ax=b */
+function solveLinearSystem(A, b){
+  const n = A.length; // should be 8
+  const m = A[0].length; // should be 8
+  // create augmented matrix
+  const M = new Array(n);
+  for(let i=0;i<n;i++){
+    M[i] = A[i].slice();
+    M[i].push(b[i]);
+  }
+  // forward elimination
+  for(let k=0;k<m;k++){
+    // find pivot
+    let i_max = k;
+    for(let i=k+1;i<n;i++){
+      if(Math.abs(M[i][k]) > Math.abs(M[i_max][k])) i_max = i;
+    }
+    if(Math.abs(M[i_max][k]) < 1e-12) return null; // singular
+    // swap
+    [M[k], M[i_max]] = [M[i_max], M[k]];
+    // normalize pivot row
+    const pivot = M[k][k];
+    for(let j=k;j<=m;j++) M[k][j] /= pivot;
+    // eliminate
+    for(let i=0;i<n;i++){
+      if(i===k) continue;
+      const factor = M[i][k];
+      for(let j=k;j<=m;j++) M[i][j] -= factor * M[k][j];
+    }
+  }
+  // extract solution
+  const x = [];
+  for(let i=0;i<m;i++) x.push(M[i][m]);
+  return x;
+}
+
+/* ======= GPS acquisition ======= */
+function acquireGPS(){
+  if(!navigator.geolocation) {
+    gpsInfoSpan.textContent = 'not supported';
+    return;
+  }
+  gpsInfoSpan.textContent = 'acquiring...';
+  navigator.geolocation.getCurrentPosition(pos=>{
+    gps = {lat: pos.coords.latitude, lon: pos.coords.longitude, acc: pos.coords.accuracy, ts: pos.timestamp};
+    gpsInfoSpan.textContent = `${gps.lat.toFixed(6)}, ${gps.lon.toFixed(6)} (±${Math.round(gps.acc)} m)`;
+  }, err=>{
+    gpsInfoSpan.textContent = 'permission denied / unavailable';
+    console.warn(err);
+  }, { enableHighAccuracy: true, timeout: 7000 });
+}
+
+/* ======= Save original to DB button ======= */
+saveBtn.addEventListener('click', async ()=>{
+  if(!imageBlob) { status('no image to save'); return; }
+  try {
+    const metadata = {gps, w: imgNaturalSize.w, h: imgNaturalSize.h};
+    const id = await saveOriginalToDB(imageBlob, metadata);
+    status(`saved original as id ${id}`);
+  } catch(e){
+    console.error(e);
+    status('save error');
+  }
+});
+
+/* list stored originals */
+listBtn.addEventListener('click', async ()=>{
+  const items = await listStored();
+  storedListDiv.innerHTML = '';
+  if(items.length === 0) { storedListDiv.textContent = 'no stored originals'; return; }
+  items.forEach(it=>{
+    const row = document.createElement('div'); row.className='rowItem';
+    const thumb = document.createElement('img'); thumb.style.width='80px'; thumb.style.height='auto';
+    // create objectURL for thumbnail
+    const url = URL.createObjectURL(it.blob);
+    thumb.src = url;
+    const meta = document.createElement('div'); meta.className='smallText';
+    meta.innerHTML = `id:${it.id} ts:${new Date(it.ts).toLocaleString()}<br>gps:${it.metadata.gps ? (it.metadata.gps.lat.toFixed(6)+','+it.metadata.gps.lon.toFixed(6)) : '—'}`;
+    const delBtn = document.createElement('button'); delBtn.className='small'; delBtn.textContent='Delete';
+    delBtn.addEventListener('click', async ()=>{ await deleteStored(it.id); row.remove(); });
+    const useBtn = document.createElement('button'); useBtn.className='small'; useBtn.textContent='Load';
+    useBtn.addEventListener('click', ()=>{ loadBlobToEditor(it.blob); });
+    row.appendChild(thumb); row.appendChild(meta); row.appendChild(useBtn); row.appendChild(delBtn);
+    storedListDiv.appendChild(row);
+  });
+});
+
+/* load an image blob from DB into editor */
+function loadBlobToEditor(blob){
+  imageBlob = blob;
+  const img = new Image();
+  img.onload = () => {
+    currentImage = img;
+    imgNaturalSize = {w: img.naturalWidth, h: img.naturalHeight};
+    setupCanvasForImage(img);
+    initCrosshairsCentered();
+    drawImage();
+    drawOverlay();
+    computeRectifiedAndShow();
+    status('loaded from DB');
+  };
+  img.src = URL.createObjectURL(blob);
+}
+
+/* ======= Share button ======= */
+shareBtn.addEventListener('click', async ()=>{
+  if(!rectifiedImgEl._blob) { status('no rectified image to share'); return; }
+  const blob = rectifiedImgEl._blob;
+  try{
+    // Use Web Share API if available and can share files
+    if(navigator.share && navigator.canShare && navigator.canShare({files:[new File([blob],'rectified.jpg',{type:blob.type})]})){
+      const f = new File([blob], 'rectified.jpg', {type: blob.type});
+      await navigator.share({files:[f], title:'Rectified image', text:'Rectified using Image Rectifier'});
+      status('shared. deleting original from DB (if matched)');
+      // find and delete the stored original that matches the current image blob (best-effort)
+      // note: matching blobs is not straightforward; we'll remove the most-recent stored item that has same size as imageBlob
+      if(imageBlob){
+        const items = await listStored();
+        // choose candidate where blob size equals original blob size
+        const candidate = items.find(it=>it.blob.size === imageBlob.size);
+        if(candidate) {
+          await deleteStored(candidate.id);
+          status(`deleted original id ${candidate.id}`);
+        } else {
+          status('no matching stored original found to delete');
+        }
+      }
+    } else {
+      // fallback: trigger download
+      const a = document.createElement('a');
+      const url = URL.createObjectURL(blob);
+      a.href = url;
+      a.download = 'rectified.jpg';
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      URL.revokeObjectURL(url);
+      status('downloaded rectified image (Web Share unsupported). Deleted original if stored.');
+      // same deletion heuristic
+      if(imageBlob){
+        const items = await listStored();
+        const candidate = items.find(it=>it.blob.size === imageBlob.size);
+        if(candidate) {
+          await deleteStored(candidate.id);
+          status(`deleted original id ${candidate.id}`);
+        }
+      }
+    }
+  } catch(err){
+    console.error(err);
+    status('share failed');
+  }
+});
+
+/* small helper to update status */
+function status(s){ statusSpan.textContent = s; }
+
+/* initial small hint */
+status('ready');
+
+/* auto-draw on window resize to reposition handles */
+window.addEventListener('resize', ()=>{
+  if(!currentImage) return;
+  // redraw image sized to new viewport
+  setupCanvasForImage(currentImage);
+  drawImage();
+  // reposition handles: we keep the crosshair points in display coords (they are relative to canvas size),
+  // so we need to scale them proportionally if canvas size changed. For simplicity, re-init centered.
+  initCrosshairsCentered();
+  drawOverlay();
+  computeRectifiedAndShow();
+});
+</script>
+</body>
+</html>
